@@ -61,11 +61,9 @@ K3的2.8T参数，不仅是目前已知最大的开源模型之一，更是第�
 
 相比前代K2，K3在架构上实现了显著突破：
 
-KDA混合线性注意力机制，专为超长序列设计；
-
-Attention Residuals，提升深层模型的训练稳定性；
-
-MoE大幅优化：896个专家，仅激活16个，结合Stable LatentMoE框架，在保持巨量参数的同时极大提高了计算效率。
+<mark style="background: #FFF3A3A6;">KDA混合线性注意力机制，专为超长序列设计</mark>；
+<mark style="background: #D2B3FFA6;">Attention Residuals，提升深层模型的训练稳定性</mark>；
+<mark style="background: #BBFABBA6;">MoE大幅优化：896个专家，仅激活16个，结合Stable LatentMoE框架，在保持巨量参数的同时极大提高了计算效率</mark>。
 
 官方数据显示，这些创新让K3的整体扩展效率较K2提升约2.5倍，真正做到了「规模」与「可用性」的平衡。
 
