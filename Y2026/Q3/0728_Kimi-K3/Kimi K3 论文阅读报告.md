@@ -49,11 +49,128 @@ Kimi K3 沿着 **train-time scaling** 和 **test-time scaling** 两条轴同时�
 - 2 个 shared experts 每层
 - Latent MoE 维度 = 3584 (0.5x hidden dimension)
 
+#### 它究竟把什么“变宽”了
+
+Stable LatentMoE 归在 K3 的**宽度维（model width）**，但不是把主干 hidden dimension 直接从 $7168$ 扩大。它扩展的是**条件容量**：
+
+- 专家池更大：896 个 routed experts；
+- 每个 token 可组合的专业化路径更多：每 token 激活 16 个 routed experts；
+- 总参数容量更大，但每个 token 只计算其中一小部分；
+- 主干 hidden dimension 仍是 $d=7168$，routed expert 使用的是更窄的 latent dimension $\ell=3584=d/2$。
+
+标准 MoE 让每个 routed expert 接收完整的 $d$ 维表示；LatentMoE 则把 routed path 压到低维空间：
+
+$$
+x\in\mathbb{R}^{d}
+\xrightarrow{W_{\downarrow}}
+z\in\mathbb{R}^{\ell}
+\xrightarrow{\text{selected routed experts}}
+u\in\mathbb{R}^{\ell}
+\xrightarrow{\operatorname{RMSNorm},\,W_{\uparrow}}
+y_{\text{routed}}\in\mathbb{R}^{d}
+$$
+
+K3 的 routed expert 路径可以概括为：
+
+```text
+x ∈ R^7168
+  ├─ shared experts：直接在 7168 维处理公共变换
+  └─ W↓：7168 → 3584
+       └─ router 选择 16/896 个专家
+            └─ 专家在 3584 维 latent space 中计算
+                 └─ 加权聚合 + RMSNorm
+                      └─ W↑：3584 → 7168
+                           └─ 与 shared experts 相加
+```
+
+因此，LatentMoE 的杠杆是：**一次共享的降维/升维，换取大量 routed experts 的低维化**。它降低了 routed expert 的通信、权重读取和内部计算，使专家池可以继续扩大。
+
+粗略地看，普通 MoE 的 routed 通信与每 token 激活数成正比于 $kd$；LatentMoE 降为 $k\ell$。当 $\ell=d/2$ 时，routed path 的表示通信宽度约减半。代价是：单个 routed expert 的工作空间变窄，所以这不是“每个专家都变宽”，而是**专家池变宽、单个专业分支变窄**。
+
+#### 与 DeepSeekMoE 的差异
+
+K3 的 Stable LatentMoE 沿用了 DeepSeekMoE 的基本组织方式：**shared experts + routed experts**。shared experts 负责所有 token 都需要的公共变换，routed experts 负责 token 条件化的专业变换。
+
+但两者的主要差异在 routed expert 的工作空间：
+
+| 维度 | DeepSeekMoE | K3 Stable LatentMoE |
+| --- | --- | --- |
+| Routed expert 输入 | 完整 $d$ 维表示 | 先压缩到 $\ell$ 维 |
+| Routed expert 内部 | 在完整 hidden width 上计算 | 在低维 latent space 上计算 |
+| 扩容思路 | 细粒度切分、增加专家组合 | 增加专家池，同时压低 routed path 宽度 |
+| Shared experts | 隔离公共知识 | 隔离公共知识，并保留 full-width 公共路径 |
+| 主要解决的问题 | 专家重复、专业化不足 | 专业化、通信/计算成本与极端稀疏稳定性 |
+
+一句话：
+
+> **DeepSeekMoE 主要把专家切得更细；LatentMoE 进一步把 routed expert 的通道压窄，让专家池可以更大。**
+
+不要把两种 `latent` 混淆：
+
+- **DeepSeek MLA 的 latent**：压缩 token 级 KV cache，解决序列长度与推理显存；
+- **K3 LatentMoE 的 latent**：压缩 routed expert 的 channel representation，解决模型宽度、专家容量与 MoE 通信。
+
 **三大稳定化改进:**
 
-- **Normalized LatentMoE**: 在 expert aggregation 和 up-projection 之间插入 RMSNorm, 抑制激活爆炸
-- **SiTU-GLU**: $\beta_1 \tanh(x/\beta_1) \odot \sigma(x)$ (gate) 与 $\beta_2 \tanh(x/\beta_2)$ (up) 组合, $\beta_1=4$, $\beta_2=25$, 保持 SwiGLU 的局部行为但全局有界
-- **Quantile Balancing (QB)**: 替代固定步长辅助 loss, 通过 router score 的 quantile 直接设置 expert bias, 在 103 级 expert 规模下实现完美负载均衡
+- **Normalized LatentMoE**：原始 LatentMoE 在专家聚合后直接做 $W_{\uparrow}u$。K3 改为：
+
+  $$
+  y_{\text{routed}}=W_{\uparrow}\operatorname{RMSNorm}(u)
+  $$
+
+  其中 $u=\sum_{i\in T_k(x)}p_iE_i^{routed}(W_{\downarrow}x)$。RMSNorm 让不同专家组合、不同 router 权重造成的尺度变化不会直接传入升维投影，也避免 routed branch 与 full-width shared branch 相加时幅值失衡。
+
+- **SiTU-GLU**：SwiGLU 的 gate 和 up 分支都可能无界，极端值相乘会产生 activation outlier。K3 用 soft cap：
+
+  $$
+  \operatorname{softcap}(x,\beta)=\beta\tanh(x/\beta)
+  $$
+
+  $$
+  \operatorname{SiTU\text{-}GLU}(x)
+  =
+  \beta_1\tanh\left(\frac{W_gx}{\beta_1}\right)
+  \odot \sigma(W_gx)
+  \odot
+  \beta_2\tanh\left(\frac{W_ux}{\beta_2}\right)
+  $$
+
+  K3 取 $\beta_1=4,\beta_2=25$，在原点附近保留近似 SwiGLU 的行为，在大值区域逐渐饱和，并给出近似输出上界 $|f(x)|\leq\beta_1\beta_2=100$。这有利于控制多层矩阵乘法叠加、低精度训练和极端稀疏下的激活溢出。
+
+- **Quantile Balancing (QB)**：K3 仍采用 auxiliary-loss-free routing，但不再依赖固定步长的 bias 反馈更新，而是根据 router score 的分位数直接设定 expert bias，使每个专家接近目标负载：
+
+  $$
+  q=\frac{mk}{n}
+  $$
+
+  其中 $m$ 是 batch token 数、$k$ 是每 token 激活专家数、$n$ 是专家总数。直观上，DeepSeek 的 bias 调整更像“根据冷热反馈逐步修正”，K3 QB 更像“根据全 batch 分布直接校准阈值”。大规模训练中使用 histogram 估计全局分位数，避免收集全量 router score。
+
+#### 为什么叫 Stable
+
+“Stable”不是 LatentMoE 天然稳定，而是 K3 针对极端稀疏的三类失稳分别加了约束：
+
+| 机制 | 主要问题 | 稳定对象 |
+| --- | --- | --- |
+| 聚合后 RMSNorm | 不同专家组合导致 routed representation 尺度漂移 | 数值尺度 |
+| SiTU-GLU | gate/up 乘法导致 activation outlier 和溢出 | 激活与梯度 |
+| Quantile Balancing | 896 个专家的负载冷热不均 | 路由与专家训练机会 |
+| MoonEP / static shape | Expert Parallel 执行形状波动、通信与 host sync | 系统执行 |
+
+所以：
+
+$$
+\text{Stable LatentMoE}
+=
+\text{LatentMoE}
++
+\text{数值稳定}
++
+\text{路由稳定}
++
+\text{系统稳定}
+$$
+
+K3 的关键不是单纯“把专家数量从 384/256 增加到 896”，而是同时处理了**容量扩展的成本**与**极端稀疏的稳定性**。
 
 ### 4. MoonViT-V2
 

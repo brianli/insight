@@ -127,18 +127,79 @@ K3注意力层为69 KDA + 24 Gated MLA（约3:1）：多数层走线性注意力
 
 **Stable LatentMoE**
 
-K2/K2.5已是较大稀疏MoE；K3进一步把专家池扩到896、每token激活16个、共享专家2个。
+K2/K2.5已是较大稀疏MoE；K3进一步把专家池扩到896、每 token 激活16个、共享专家2个。这里的“宽度扩展”不是把主干 hidden size 直接变大，而是扩大**条件专家容量**：专家池更大、每个 token 的专业化组合更多，同时保持每个 token 只激活少量专家。
+
+K3 主 hidden dimension 为 $d=7168$，LatentMoE dimension 为 $\ell=3584=d/2$。routed expert 不直接接收完整 $d$ 维表示，而是先经过共享的降维投影，再在低维 latent space 中完成专家计算，最后映射回 $d$ 维：
+
+$$
+x\in\mathbb{R}^{d}
+\xrightarrow{W_{\downarrow}}
+z\in\mathbb{R}^{\ell}
+\xrightarrow{\text{Top-16 routed experts}}
+u\in\mathbb{R}^{\ell}
+\xrightarrow{\operatorname{RMSNorm},\,W_{\uparrow}}
+y_{\mathrm{routed}}\in\mathbb{R}^{d}
+$$
+
+完整结构是：
+
+```text
+x ∈ R^7168
+  ├─ 2 个 shared experts：直接在 7168 维处理公共变换
+  └─ W↓：7168 → 3584
+       └─ router 选择 16/896 个 routed experts
+            └─ 每个专家在 3584 维 latent space 中计算
+                 └─ 加权聚合 + RMSNorm
+                      └─ W↑：3584 → 7168
+                           └─ 与 shared experts 输出相加
+```
+
+这使得 routed path 的表示通信宽度从约 $kd$ 降到 $k\ell$，专家内部的主计算也从完整 hidden width 转移到 latent width。由于降维/升维投影在专家之间共享，专家数量增加时不需要复制这部分成本。
+
+因此更准确的表述是：
+
+> **不是每个专家变宽，而是专家池变宽、专家组合空间变大；单个 routed expert 在更窄的 latent space 中工作。**
+
+### Stable LatentMoE 与 DeepSeekMoE
+
+K3 沿用了 DeepSeekMoE 的 **shared experts + routed experts** 组织方式：shared experts 承担所有 token 都需要的公共变换，routed experts 提供 token 条件化的专业变换。
+
+关键差异在 routed expert 的工作空间：
+
+| 维度 | DeepSeekMoE | K3 Stable LatentMoE |
+| --- | --- | --- |
+| Routed expert 输入 | 完整 $d$ 维表示 | 先压缩到 $\ell$ 维 |
+| 专家内部计算 | 完整 hidden width | 低维 latent width |
+| 扩容方式 | 细粒度专家分割与更多组合 | 大专家池 + 低维 routed path |
+| Shared experts | 隔离公共知识、减少 routed 专家重复 | 同样隔离公共知识，并保留 full-width 公共路径 |
+| 主要目标 | 专家专业化与组合性 | 专业化、通信/计算效率与极端稀疏稳定性 |
+
+一句话：
+
+> **DeepSeekMoE 把专家切得更细；Stable LatentMoE 进一步把 routed expert 压窄，让专家池可以继续扩大。**
 
 配套手段主要包括：
 
-- **Quantile Balancing** ：专家分配直接由router score的分位数推导，弱化依赖敏感超参的启发式负载均衡更新。
-- **SiTU-GLU（Sigmoid Tanh Unit + GLU）** ：相对SwiGLU，gate侧用𝛽⋅tanh⁡(𝑥/𝛽)⋅𝜎(𝑥)限幅并对up支路做有界变换，增强极端稀疏下的激活控制。
+- **Normalized LatentMoE** ：专家加权聚合后先做 RMSNorm，再进行 $W_{\uparrow}$ 升维，减少不同专家组合和 router 权重造成的尺度漂移，避免 routed branch 与 shared branch 相加时幅值失衡。
+- **SiTU-GLU（Sigmoid Tanh Unit + GLU）** ：相对 SwiGLU，gate 和 up 分支都用 $\beta\tanh(x/\beta)$ 做 soft cap。K3 取 $\beta_1=4,\beta_2=25$，保留原点附近近似 SwiGLU 的行为，同时让大值区域有界，控制 activation outlier、低精度溢出和梯度异常。
+- **Quantile Balancing** ：仍采用 auxiliary-loss-free routing，但根据 router score 的目标分位数直接设置 expert bias，而不是依赖固定步长的冷热反馈更新。目标负载为 $q=mk/n$，其中 $m$ 是 batch token 数、$k$ 是每 token 激活专家数、$n$ 是专家总数；大规模训练中用 histogram 估计全局分位数。
 - **Per-Head Muon** ：把Muon优化扩展到按attention head独立适配，利于大规模下更细粒度的学习动态。
 - **Fully balanced expert-parallel** ：训练侧强调静态shape、关键路径上无host sync，减轻大EP规模下因专家不均衡带来的吞吐抖动。
 
 ![Image](https://mmbiz.qpic.cn/mmbiz_png/uIP3tuXZx8DOGqcQnn3TpiceJl7QSgf8ibibkyFJBbdzPiauTHgxR7IrxfaZe9gERo0cPvPx9PBbt9VictjCfXLhxrPYxDdQvJiar5OMm59wYNV0I/640?wx_fmt=png&from=appmsg&watermark=1&tp=webp&wxfrom=5&wx_lazy=1#imgIndex=6)
 
-Routed专家实际路径是：先把7168投影到3584，再在专家内做3584→3072→3584的SiTU-GLU，最后映回7168，并与shared experts相加。K3从SFT阶段起做量化感知训练（权重MXFP4、激活MXFP8）。
+Routed 专家实际路径是：先把 7168 投影到 3584，再在专家内做 3584→3072→3584 的 SiTU-GLU，最后映回 7168，并与 shared experts 相加。K3 从 SFT 阶段起做量化感知训练（权重 MXFP4、激活 MXFP8）。
+
+这里的 `latent` 不要与 DeepSeek MLA 的 latent 混淆：
+
+- MLA latent 压缩的是 token 级 KV 表示，目标是降低 KV cache；
+- LatentMoE latent 压缩的是 routed expert 的 channel 表示，目标是扩大专家容量并降低 MoE 通信/计算成本。
+
+Stable 的含义是三层稳定化：
+
+1. **数值稳定**：聚合后 RMSNorm 控制 routed representation 尺度；
+2. **激活稳定**：SiTU-GLU 为 gate/up 分支提供平滑上限；
+3. **路由与系统稳定**：Quantile Balancing 均衡专家负载，MoonEP 用静态 shape 和 bounded redundant experts 兑现硬件利用率。
 
 **2.5**
 
