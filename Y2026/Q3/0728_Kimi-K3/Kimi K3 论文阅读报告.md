@@ -179,13 +179,1388 @@ K3 的关键不是单纯“把专家数量从 384/256 增加到 896”，而是�
 - 发现: 对比预训练对多模态语言模型的初始化**不是必需的**。
 - 27 层 ViT, ~0.4B 参数, 支持图像和视频
 
-### 5. Per-Head Muon
+### 5. Per-Head Muon：为什么被放在 Model Architecture
 
-将 Muon 优化器的 Newton-Schulz 正交化从 full attention 投影矩阵粒度细化到**per-head**, 使各 head 的更新尺度更均衡。
+#### 5.1 先给结论
+
+K3 技术报告 §2.5 讨论的不是一个新的 forward layer，而是：
+
+> **K3 如何更新 attention projection 的参数。**
+
+Per-Head Muon 将 Q/K/V 投影矩阵沿 attention head 维度切分，对每个 head 的 momentum 独立执行 Newton–Schulz orthogonalization，再合并更新。目标是：
+
+- 减少不同 attention head 的梯度 / momentum 尺度差异造成的相互压制；
+- 让每个 head 的矩阵更新在自己的几何结构中归一化；
+- 提升大规模训练时的稳定性；
+- 略微降低 Newton–Schulz 正交化的优化器开销。
+
+因此，§2.5 的关键不是“换了一个更好的 optimizer”，而是：
+
+> **K3 既然把 attention 拆成了大量功能可能不同的 heads，就需要把参数更新也细化到 head 粒度，避免优化器把这些子系统重新粗暴耦合起来。**
+
+需要严格区分两个图：
+
+```text
+forward graph：信息如何流动
+    KDA / Gated MLA / AttnRes / Stable LatentMoE
+
+backward-update graph：梯度如何变成参数更新
+    Muon / Per-Head Muon / weight clipping / learning-rate schedule
+```
+
+Per-Head Muon 不改变推理时的 token 计算图，但改变了模型形成能力的训练动力学。
+
+这里的 $g_t$ 是“优化器里的梯度”，不要和 KDA 公式中的 $g_t$（log-decay）混淆。两个符号相同，但语义完全不同。
+
+#### 5.2 Muon 在做什么
+
+普通 AdamW 的更新可以粗略写成：
+
+$$
+W_{t+1}
+=
+W_t-\eta \cdot \frac{m_t}{\sqrt{v_t}+\epsilon}
+$$
+
+它主要在 scalar 参数粒度上做自适应缩放。Muon 则把矩阵参数的 momentum 当成一个整体来处理：
+
+$$
+m_t=\beta m_{t-1}+(1-\beta)g_t
+$$
+
+然后对 $m_t$ 做 Newton–Schulz orthogonalization：
+
+$$
+\widetilde m_t\approx\operatorname{orth}(m_t)
+$$
+
+再用正交化后的矩阵更新参数：
+
+$$
+W_{t+1}=W_t-\eta\widetilde m_t
+$$
+
+这里的“正交化”不是把模型权重永久约束成正交矩阵，而是对**更新矩阵**做几何变换。若将矩阵更新写成 SVD：
+
+$$
+m=U\Sigma V^\top
+$$
+
+可以把 Muon 的作用粗略理解为：保留主要的左右奇异向量方向，同时弱化奇异值尺度差异对更新幅度的支配：
+
+$$
+\operatorname{orth}(m)\approx UV^\top
+$$
+
+因此，Muon 与 AdamW 的区别不是简单的“学习率更大或更小”，而是：
+
+| 方法 | 主要处理对象 | 直觉 |
+| --- | --- | --- |
+| SGD | 原始梯度 | 梯度多大，更新就多大 |
+| AdamW | 单个参数元素 | 每个 scalar 独立调节 |
+| Muon | 矩阵更新的几何结构 | 不让少数奇异方向独占更新 |
+
+上面对 Muon 的解释是机制层面的近似；技术报告 §2.5 本身没有展开 Newton–Schulz 的具体迭代式，而是直接说明其在 K3 中的结构化使用方式。
+
+#### 5.3 Per-Head Muon 的数学结构
+
+K3 有 96 个 attention heads，单 head dimension 为 128。以 Q 投影为例，完整矩阵可以按 head 拆成：
+
+$$
+W_q=
+\begin{bmatrix}
+W_q^{(1)}\\
+W_q^{(2)}\\
+\vdots\\
+W_q^{(96)}
+\end{bmatrix}
+$$
+
+其中：
+
+$$
+W_q^{(h)}\in\mathbb{R}^{128\times7168}
+$$
+
+完整 Q 投影矩阵的形状约为：
+
+$$
+W_q\in\mathbb{R}^{(96\times128)\times7168}
+=\mathbb{R}^{12288\times7168}
+$$
+
+普通 full-matrix Muon 的处理方式是：
+
+$$
+\widetilde M_q=
+\operatorname{orth}
+\left(
+\begin{bmatrix}
+M_q^{(1)}\\
+\vdots\\
+M_q^{(96)}
+\end{bmatrix}
+\right)
+$$
+
+Per-Head Muon 则是：
+
+$$
+\widetilde M_q^{(h)}
+=
+\operatorname{orth}\left(M_q^{(h)}\right)
+$$
+
+最后再拼回完整更新矩阵：
+
+$$
+\widetilde M_q
+=
+\operatorname{concat}
+\left(
+\widetilde M_q^{(1)},
+\ldots,
+\widetilde M_q^{(96)}
+\right)
+$$
+
+二者一般不等价：
+
+$$
+\operatorname{orth}
+\left(
+\operatorname{concat}_h M^{(h)}
+\right)
+\neq
+\operatorname{concat}_h
+\operatorname{orth}\left(M^{(h)}\right)
+$$
+
+Per-Head Muon 的作用，正是打断不必要的 head 间矩阵归一化耦合。它不会让 attention heads 在 forward 中彼此独立；Q/K/V 仍然会通过 attention 计算和 output projection 发生交互。被拆开的只是优化器对更新矩阵的处理粒度。
+
+#### 5.4 为什么 full-matrix Muon 可能压制小尺度 head
+
+K3 的 96 个 attention heads 虽然形状相同，但功能不一定相同。不同 head 可能偏向：
+
+- 局部模式；
+- 代码语法与括号结构；
+- 长距离引用；
+- 位置 / recency；
+- KDA 状态写入与读取；
+- MLA 的全局内容检索；
+- 视觉 token 与文本 token 的交互。
+
+因此，不同 head 的梯度或 momentum 尺度可能差异很大：
+
+$$
+\|M^{(1)}\|_F\gg\|M^{(2)}\|_F
+$$
+
+按照技术报告 §2.5 给出的直觉，full-matrix orthogonalization 把所有 heads 当成一个 coupled block。大梯度 / 大 momentum 的 head 更容易影响整体更新方向，而小尺度 head 得不到充分的独立归一化。
+
+直观地说：
+
+```text
+full-matrix Muon
+    所有 head 进入同一个矩阵级归一化器
+    强信号 head 参与决定整体更新几何
+    弱信号 head 的独立尺度可能被掩盖
+
+Per-Head Muon
+    每个 head 在自己的矩阵内部完成正交化
+    head 的更新参考系彼此分开
+    再把各 head 更新拼回 projection
+```
+
+这不是要把每个 head 的更新范数强行设成一样，而是：
+
+> **让每个 head 的更新尺度由自己的矩阵结构决定，而不是由其他 head 的梯度规模间接决定。**
+
+因此，Per-Head Muon 不能简单等同于“给每个 head 一个独立学习率”：
+
+独立学习率只是：
+
+$$
+W_h\leftarrow W_h-\eta_hG_h
+$$
+
+Per-Head Muon 则是：
+
+$$
+W_h\leftarrow W_h-\eta\operatorname{orth}(M_h)
+$$
+
+前者只调节整体幅值，后者还改变矩阵更新的方向结构。
+
+#### 5.5 为什么 K3 特别需要按 head 优化
+
+##### 1. K3 的 attention 已经不是同质的标准 MHA
+
+K3 采用约 3:1 的 Hybrid Attention：
+
+- 69 层 KDA；
+- 24 层 Gated MLA；
+- backbone 末端额外增加一层 Gated MLA。
+
+KDA 和 MLA 的职责不同：
+
+| 模块 | 主要机制 | 更偏向的能力 |
+| --- | --- | --- |
+| KDA | 递归 state、delta update、channel-wise decay | 位置敏感、recency-aware、线性成本的历史混合 |
+| Gated MLA | latent KV、全局 token-to-token attention | 不受限的全局内容检索 |
+
+即便同一层内部的 head 形状相同，它们承担的统计角色也可能不同。优化器如果总把它们看成一个完整矩阵，就存在 forward 结构和 update 结构不匹配的问题。
+
+##### 2. NoPE 将位置建模压力转移给 attention dynamics
+
+K3 的 MLA 层使用 NoPE。报告的设计逻辑是：
+
+- KDA 通过递归、decay 和 state update 提供 position-sensitive / recency-aware mixing；
+- MLA 提供 unrestricted global content interaction。
+
+这意味着不同 KDA head 可能学出不同的时间尺度：
+
+- 有的 head 更保留近期信息；
+- 有的 head 更保留远程状态；
+- 有的 head 更偏向当前 token；
+- 有的 head 更像稳定的历史 memory。
+
+KDA 本身已经存在 per-head 的量：
+
+$$
+\alpha_t^{(h)},\quad
+\beta_t^{(h)},\quad
+A_h,\quad
+b_\alpha^{(h)}
+$$
+
+这会进一步增强 head 的异质性。模型在 forward 中允许每个 head 拥有不同的时间动力学，optimizer 就不应再用一个过于粗粒度的全局矩阵归一化器处理所有 head。
+
+##### 3. K3 将 head 数从 64 增加到 96
+
+K3 与 K2 的相关变化是：
+
+| 项目 | K2 | K3 |
+| --- | ---: | ---: |
+| Attention heads | 64 | 96 |
+| Hidden size | 7168 | 7168 |
+| Attention | MLA | Hybrid KDA–MLA |
+| Training context | 128K | 1M |
+
+hidden size 不变、head dimension 仍为 128，但 head 数增加意味着：
+
+- 子空间分工更细；
+- head 间梯度差异更容易放大；
+- 更可能出现少数强 head 与大量弱 head；
+- full-matrix update 的跨 head 耦合成本更高。
+
+因此，Per-Head Muon 与 K3 的扩头、混合注意力和长上下文设计是配套的，而不是孤立的 optimizer trick。
+
+#### 5.6 为什么它被放在 Model Architecture
+
+从教科书分类看，Per-Head Muon 属于 optimization / training。但 K3 把它放在 §2 Model Architecture，原因不是排版偶然，而是作者采用了更宽的“架构”定义。
+
+##### 第一层：K3 的架构是可训练系统，不只是 forward graph
+
+K3 第 2 节把模型设计概括为沿三个信息流维度扩展：
+
+| 维度 | K3 机制 | 解决的问题 |
+| --- | --- | --- |
+| Token mixing | KDA + Gated MLA | 长上下文中如何混合 token |
+| Layer mixing | Attention Residuals | 深度方向如何选择历史表示 |
+| Channel mixing | Stable LatentMoE | 如何扩大条件容量而不让每 token 成本爆炸 |
+| Parameter update | Per-Head Muon | 如何让异质 attention heads 稳定学习 |
+
+前三项改变 forward 的信息流，最后一项改变 backward 的参数流。K3 关注的不是单独某个模块，而是：
+
+> **信息、表示、容量和梯度如何在一个超大模型中流动。**
+
+##### 第二层：Per-Head Muon 是结构特化的，不是通用配置
+
+如果报告只写“使用 AdamW、学习率为某值、weight decay 为某值”，它当然属于训练配方。
+
+但 Per-Head Muon 依赖：
+
+- Q/K/V projection 的矩阵形状；
+- attention head 的切分方式；
+- head dimension；
+- 参数是否按 head block 组织；
+- 分布式 optimizer 的参数分片；
+- Newton–Schulz 对不同矩阵形状的计算方式。
+
+如果 head 数、head dimension 或 projection layout 改变，Per-Head Muon 的实现也会随之改变。因此它更像：
+
+- attention 的训练伴生结构；
+- head-wise parameterization 的优化版本；
+- architecture-aware optimizer。
+
+##### 第三层：K3 的 scaling efficiency 依赖优化器把容量“兑现”
+
+K3 报告声称相对 K2 有约 2.5× 的 overall scaling efficiency 提升。这个结果不能归因于某个模块的孤立收益，而是：
+
+$$
+\text{Scaling Efficiency}
+=
+f(
+\text{attention},
+\text{residual},
+\text{MoE},
+\text{vision},
+\text{optimizer},
+\text{data},
+\text{systems}
+)
+$$
+
+架构扩展如果没有匹配的优化动力学，新增的参数和子空间未必能转化为有效能力。Per-Head Muon 的定位就是把结构扩展转化为可训练性和有效 scaling。
+
+#### 5.7 它与 K3 其他稳定化设计的关系
+
+K3 的稳定性不是靠一个技巧，而是对不同动力学层次分别加约束：
+
+| 机制 | 被稳定的对象 | 主要手段 |
+| --- | --- | --- |
+| KDA lower-bounded decay | token / recurrent state dynamics | 将 log-decay 限制在有限区间 |
+| Attention Residuals | layer / depth dynamics | 深度方向的选择性聚合 |
+| Stable LatentMoE | channel / expert dynamics | RMSNorm、SiTU-GLU、Quantile Balancing |
+| Per-Head Muon | attention parameter dynamics | head 内独立的矩阵正交化 |
+
+可以写成：
+
+```text
+KDA decay gate        → 稳定 token/state dynamics
+AttnRes               → 稳定 layer/depth dynamics
+Stable LatentMoE      → 稳定 channel/expert dynamics
+Per-Head Muon         → 稳定 parameter/update dynamics
+```
+
+所以，Per-Head Muon 不是和 KDA、AttnRes、LatentMoE 平行的又一个 forward 模块，而是 K3 设计的“优化维度”：
+
+$$
+\text{K3 effective architecture}
+=
+\text{forward information flow}
++
+\text{optimization dynamics}
+$$
+
+#### 5.8 与 §3.3 Training Recipe 的关系
+
+报告在 §3.3 又写道：
+
+> We optimize the model using the Per-Head Muon optimizer together with the weight-clipping mechanism introduced in Kimi K2.
+
+这不是重复，而是两个层次：
+
+```text
+§2.5：为什么要设计 Per-Head Muon，它针对什么结构问题
+§3.3：训练时如何实际使用它，并与哪些训练配方组合
+```
+
+§3.3 同时给出：
+
+- Per-Head Muon；
+- weight clipping；
+- Quantile Balancing；
+- cosine learning-rate schedule；
+- 1% linear warmup；
+- weight decay = 0.1。
+
+这说明 Per-Head Muon 的设计理由在架构章节，具体部署方式在训练章节。
+
+#### 5.9 不要过度解读：它不保证每个 head 都学得一样好
+
+Per-Head Muon 只能解决一种优化耦合问题：
+
+> 某个 head 的大梯度 / 大 momentum 不应过度决定其他 head 的矩阵更新尺度。
+
+它不能保证：
+
+- 每个 head 都有用；
+- 所有 head 都被均匀使用；
+- attention heads 不会冗余；
+- 所有 head 的功能都能被解释；
+- 训练一定不会发生 head collapse；
+- KDA 与 MLA 的分工一定最优。
+
+它也不是简单地把每个 head 的 update norm 强行设成完全一样。更准确的说法是：
+
+> **每个 head 在自己的矩阵内部进行几何归一化，减少跨 head 尺度差异造成的间接压制。**
+
+#### 5.10 证据强度与待验证问题
+
+技术报告 §2.5 给出了清晰的机制动机，但公开证据仍然有限。报告没有详细提供：
+
+- full-matrix Muon vs. Per-Head Muon 的独立 ablation；
+- Per-Head Muon vs. AdamW 的对照；
+- KDA 与 MLA 分别使用 Per-Head Muon 的结果；
+- head-wise gradient norm / update norm 分布；
+- 正交化前后的 singular-value spectrum；
+- loss、scaling law 和下游 benchmark 的独立增益。
+
+因此应做如下判断：
+
+| 判断维度 | 评价 |
+| --- | --- |
+| 机制动机 | 中高 |
+| 与 K3 结构的匹配性 | 高 |
+| 独立性能贡献是否已证实 | 中低 |
+| 工程价值 | 较高 |
+| 能否单独解释 K3 能力提升 | 不能 |
+
+不要把“设计合理”误写成“贡献已被证明”。目前我们知道它为什么可能有效，但不知道它对 K3 最终能力贡献了多少。
+
+#### 5.11 对 2.5 的最终理解
+
+K3 的四个主要架构维度可以这样记：
+
+```text
+序列维 token mixing
+    └── KDA + Gated MLA
+          解决：1M context 下如何混合 token
+
+深度维 layer mixing
+    └── Attention Residuals
+          解决：93 层之间如何选择历史表示
+
+宽度维 channel mixing
+    └── Stable LatentMoE
+          解决：如何扩大专家容量而不让每 token 成本爆炸
+
+优化维 parameter update
+    └── Per-Head Muon
+          解决：如何让 96 个异质 attention heads 稳定学习
+```
+
+最重要的一句话：
+
+> **KDA、AttnRes、Stable LatentMoE 在扩大 K3 的信息处理能力；Per-Head Muon 在保证这些新增自由度不会因为错误的更新几何而学不出来。**
+
+下一步最值得做的验证实验是：对 full-matrix Muon、Per-Head Muon 和 AdamW 做三方对照，并分别在 KDA / MLA 上记录 gradient norm、update norm、singular-value spectrum、训练 loss scaling 以及下游任务结果。否则只能回答“为什么它可能有效”，不能回答“它到底贡献了多少”。
+
+#### 5.12 从 $g_t$ 到 $m_t$：为什么它们是矩阵
+
+这里最容易混淆的一点是：**梯度不是天然的标量或向量；梯度的形状跟着参数走。**
+
+设某个 attention projection 的参数是矩阵：
+
+$$
+W\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}
+$$
+
+那么损失函数对它的梯度定义为：
+
+$$
+G=\nabla_W\mathcal{L}
+=
+\left[
+\frac{\partial\mathcal{L}}{\partial W_{ij}}
+\right]
+\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}
+$$
+
+也就是说，$G_{ij}$ 只是“损失对参数 $W_{ij}$ 的偏导数”。因为 $W$ 有多少个元素，梯度就有多少个对应元素，所以 $G$ 与 $W$ 同形状。
+
+更严格地说，把矩阵空间看成带 Frobenius 内积的向量空间，梯度满足：
+
+$$
+d\mathcal{L}
+=
+\left\langle\nabla_W\mathcal{L},dW\right\rangle_F
+=
+\operatorname{tr}
+\left(
+(\nabla_W\mathcal{L})^\top dW
+\right)
+$$
+
+因此：
+
+$$
+W\in\mathbb{R}^{m\times n}
+\quad\Longrightarrow\quad
+\nabla_W\mathcal{L}\in\mathbb{R}^{m\times n}
+$$
+
+##### 一个线性层的具体例子
+
+令：
+
+$$
+y=Wx,
+\qquad
+W\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}},
+\quad
+x\in\mathbb{R}^{d_{\mathrm{in}}},
+\quad
+\delta=\frac{\partial\mathcal{L}}{\partial y}
+\in\mathbb{R}^{d_{\mathrm{out}}}
+$$
+
+因为：
+
+$$
+d\mathcal{L}
+=
+\delta^\top dy
+=
+\delta^\top(dW)x
+$$
+
+所以：
+
+$$
+g
+=
+\nabla_W\mathcal{L}
+=
+\delta x^\top
+\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}
+$$
+
+它是一个外积矩阵。对一个 batch，若输入矩阵为 $X$、上游梯度为 $\Delta$，则：
+
+$$
+G
+=
+\frac{1}{B}\Delta^\top X
+$$
+
+仍然与 $W$ 同形状。训练框架中的 `g_t` 通常就是这个 batch 梯度，可能还经过 data-parallel 的聚合。
+
+对 K3 的 Q 投影，可以粗略写成：
+
+$$
+W_q\in\mathbb{R}^{(96\times128)\times7168}
+=
+\mathbb{R}^{12288\times7168}
+$$
+
+因此：
+
+$$
+g_t,\;m_t\in\mathbb{R}^{12288\times7168}
+$$
+
+在 Per-Head Muon 中，第 $h$ 个 head 的切片则是：
+
+$$
+W_q^{(h)},\;g_t^{(h)},\;m_t^{(h)}
+\in\mathbb{R}^{128\times7168}
+$$
+
+##### 那么 $m_t$ 为什么也是矩阵
+
+因为 momentum 不是一个额外的标量，而是**为每个矩阵参数位置保存一个历史梯度状态**：
+
+$$
+m_t
+=
+\beta m_{t-1}
++
+(1-\beta)g_t
+$$
+
+对每个元素展开就是：
+
+$$
+(m_t)_{ij}
+=
+\beta(m_{t-1})_{ij}
++
+(1-\beta)(g_t)_{ij}
+$$
+
+所以：
+
+- $\beta$ 通常是一个标量超参数；
+- $g_t$ 是当前 step 的梯度矩阵；
+- $m_{t-1}$ 是上一 step 的 momentum 矩阵；
+- $m_t$ 是当前 step 的 momentum 矩阵。
+
+它本质上是对**每一个权重位置的梯度做指数滑动平均**。矩阵结构不是由 momentum 公式创造的，而是继承自它所服务的参数 $W$。
+
+这也解释了一个边界：如果参数是 bias、LayerNorm 的 scale 或其他一维向量，那么对应的梯度和 momentum 就是向量；如果参数是标量，则是标量。K3 报告说 Muon 用于 matrix parameters，而不是把所有参数都强行送进 Muon。
+
+#### 5.13 Newton–Schulz orthogonalization 到底做了什么
+
+先把问题说准确：
+
+> Newton–Schulz 不是把 K3 的权重 $W$ 变成正交矩阵，而是把当前的 momentum / update matrix $m_t$ 变成一个**近似 polar factor**，再用这个方向更新 $W$。
+
+##### 目标：去掉更新矩阵中不均衡的奇异值
+
+对 momentum 矩阵做 SVD：
+
+$$
+m=U\Sigma V^\top
+$$
+
+其中：
+
+- $U$：输出空间中的方向；
+- $V$：输入空间中的方向；
+- $\Sigma=\operatorname{diag}(\sigma_1,\sigma_2,\ldots)$：各方向的更新强度。
+
+Muon 希望使用：
+
+$$
+\operatorname{polar}(m)
+=
+UV^\top
+$$
+
+而不是直接使用：
+
+$$
+m=U\Sigma V^\top
+$$
+
+所以它保留 $U,V$ 描述的“朝哪个输入方向、推向哪个输出方向”，但把不同方向的强度 $\sigma_i$ 拉平为近似相同的尺度。
+
+更正式地，$m$ 的 polar decomposition 可以写成：
+
+$$
+m=QH
+$$
+
+其中：
+
+$$
+Q=UV^\top,
+\qquad
+H=V\Sigma V^\top
+$$
+
+$Q$ 是 polar factor。对于方阵，$Q^\top Q=I$；对于长方形矩阵，它通常是 partial isometry：
+
+- 若矩阵高于宽，通常满足 $Q^\top Q=I$；
+- 若矩阵宽于高，通常满足 $QQ^\top=I$。
+
+因此，“orthogonalization”是工程上的简称；严格说，它对长方形矩阵产生的是具有正交行或正交列的 partial orthogonal matrix，而不一定是方阵意义上的 orthogonal matrix。
+
+##### 一个最小例子
+
+假设当前 momentum 为：
+
+$$
+m=
+\begin{bmatrix}
+10&0\\
+0&1
+\end{bmatrix}
+$$
+
+直接使用 momentum，意味着第一个方向的更新幅度是第二个方向的 10 倍。
+
+它的 SVD 中：
+
+$$
+U=V=I,
+\qquad
+\Sigma=
+\begin{bmatrix}
+10&0\\
+0&1
+\end{bmatrix}
+$$
+
+polar factor 是：
+
+$$
+Q=UV^\top=I
+$$
+
+于是 Muon 大致把更新改成：
+
+$$
+\begin{bmatrix}
+1&0\\
+0&1
+\end{bmatrix}
+$$
+
+它没有改变两个方向本身，只是取消了“第一个方向因为奇异值更大，就独占 10 倍更新幅度”的现象。
+
+所以可以用一句话理解：
+
+> **Muon 保留更新矩阵的方向结构，压平其奇异值谱。**
+
+这和只除以 Frobenius norm 不一样。若只做：
+
+$$
+\widehat m=\frac{m}{\|m\|_F}
+$$
+
+奇异值比例仍然是 $10:1$；它只是把整张矩阵统一缩放，并没有消除方向之间的相对不均衡。
+
+#### 5.14 Newton–Schulz 如何近似这个 polar factor
+
+直接用 SVD 求 $UV^\top$ 很昂贵，尤其是 K3 这种大规模分布式训练。Newton–Schulz 提供了一个只使用矩阵乘法和加法的迭代近似。
+
+一个常见的 polar iteration 写成：
+
+$$
+X_0=\frac{m}{s}
+$$
+
+其中 $s$ 是足以控制初始谱范围的缩放因子，然后反复迭代：
+
+$$
+X_{k+1}
+=
+\frac{1}{2}
+X_k
+\left(3I-X_k^\top X_k\right)
+$$
+
+为了看清它在做什么，设：
+
+$$
+X_k=U\Sigma_kV^\top
+$$
+
+由于：
+
+$$
+X_k^\top X_k
+=
+V\Sigma_k^2V^\top
+$$
+
+代入迭代式后，$U,V$ 基本保持不变，只有奇异值按下面的标量函数变化：
+
+$$
+\sigma_{k+1}
+=
+\frac{1}{2}\sigma_k(3-\sigma_k^2)
+$$
+
+这个函数的目标是把非零 $\sigma_k$ 推向 $1$：
+
+$$
+\sigma_k\rightarrow1
+$$
+
+于是：
+
+$$
+X_k
+\rightarrow
+UV^\top
+$$
+
+也就是 polar factor。
+
+更底层地说，polar factor 可以写成：
+
+$$
+\operatorname{polar}(m)
+=
+m(m^\top m)^{-1/2}
+$$
+
+Newton–Schulz 实际上是在用迭代方式近似 $(m^\top m)^{-1/2}$，但不显式做矩阵开方或 SVD。
+
+Muon 的工程实现通常只做固定次数的低阶多项式迭代，而不是追求精确收敛。这样可以把正交化转化为 GPU 擅长的 GEMM，避免显式 SVD 的高成本。官方实现使用的是有限步数的 quintic Newton–Schulz 迭代，而不是上面用于解释的无限收敛 cubic 形式；代码明确说明，有限步输出不一定精确等于 $UV^\top$，而是保留相近奇异方向、把奇异值推入有限范围的近似结果。[Muon 官方实现](https://github.com/KellerJordan/Muon/blob/master/muon.py)
+
+需要注意：上面的三次迭代式是帮助理解的标准形式。Muon 实际实现会使用归一化和更适合有限步数的多项式系数，具体细节取决于实现版本。
+
+#### 5.15 为什么要做：Muon 的收益在哪里
+
+##### 收益一：更新不再被少数奇异方向支配
+
+原始 momentum 的奇异值可能是：
+
+$$
+\Sigma=\operatorname{diag}(100,10,1,0.1)
+$$
+
+直接更新会让第一个方向成为绝对主导；polar update 则将有效方向的尺度拉到相近水平。
+
+这不是“让所有参数元素一样大”，而是让**矩阵的主方向**获得更均衡的更新机会。对于线性层来说，这比逐元素归一化更贴近它本身的矩阵结构。
+
+##### 收益二：保留矩阵结构，而不是把矩阵粗暴 flatten 成向量
+
+Adam 类方法把参数看成大量 scalar，逐元素处理：
+
+$$
+\Delta W_{ij}
+\propto
+\frac{m_{ij}}{\sqrt{v_{ij}}+\epsilon}
+$$
+
+但矩阵的功能依赖输入子空间和输出子空间之间的整体关系。Muon 直接在矩阵的奇异方向上处理更新，因此对线性层、attention projection 这样的二维参数更“结构感知”。
+
+这不是说 AdamW 错了，而是二者的归一化坐标系不同：
+
+| 方法 | 归一化参考系 | 可能保留 / 改变的东西 |
+| --- | --- | --- |
+| AdamW | 参数坐标轴 $(i,j)$ | 逐元素尺度 |
+| Muon | 矩阵奇异方向 | 整体子空间方向与谱形状 |
+
+##### 收益三：对 K3 的 Per-Head Muon，能够进一步平衡 head 之间的更新
+
+这是 K3 采用 per-head 变体的关键。
+
+完整 Q 投影可以看成把所有 head 堆叠起来：
+
+$$
+M=
+\begin{bmatrix}
+M^{(1)}\\
+\vdots\\
+M^{(96)}
+\end{bmatrix}
+$$
+
+如果对整个高矩阵做 polar update：
+
+$$
+Q^\top Q=I
+$$
+
+这只能约束整个矩阵的列空间；不同 head 对应的行 block 的 Frobenius norm 不必相同。
+
+而如果每个 head 单独做 polar update，且每个 head 的矩阵为 $128\times7168$：
+
+$$
+Q_hQ_h^\top=I_{128}
+$$
+
+于是：
+
+$$
+\|Q_h\|_F^2
+=
+\operatorname{tr}(Q_hQ_h^\top)
+=128
+$$
+
+只要各 head 形状相同，每个 head 的更新矩阵就天然拥有相同的 Frobenius 规模（忽略实现中的额外缩放、近似误差和学习率因素）。
+
+这给出一个比“让 head 更均衡”更准确的解释：
+
+> **full-matrix Muon 约束整个 projection 的全局几何；Per-Head Muon 约束每个 head 自己的局部几何，因此不会让某些 head 的大尺度更新轻易吞掉其他 head 的更新预算。**
+
+这是从矩阵形状和 polar 条件推导出的机制解释，不是 K3 报告中已经单独验证过的 ablation 结论。
+
+##### 收益四：比精确 SVD 更适合大规模 GPU 训练
+
+精确 SVD 能直接给出 $UV^\top$，但在大矩阵、分布式训练和每一步都要执行的 optimizer path 中代价很高。Newton–Schulz 使用固定次数矩阵乘法，可以更容易地：
+
+- 映射到 GPU Tensor Core / GEMM；
+- 与通信和其他 optimizer work overlap；
+- 对固定形状做 kernel 优化；
+- 避免显式构造完整 SVD 中间结果。
+
+这也是 K3 报告称 per-head block 的 Newton–Schulz iteration 略微降低 optimizer overhead 的原因。
+
+#### 5.16 这个收益不是免费的
+
+不能把 orthogonalization 解释成“永远更稳定、永远更快”。它有明确代价和风险：
+
+1. **丢掉了奇异值幅度信息。** 如果某个方向本来就应该小，polar update 仍可能给它相近的更新尺度。
+2. **噪声方向可能被放大。** 低奇异值方向如果主要是 minibatch noise，强行拉平谱可能不是好事。
+3. **需要合适的学习率和缩放。** 正交化只决定方向结构，不自动解决 update magnitude 的全部问题。
+4. **不适合所有参数。** embedding、bias、Norm scale 等一维或特殊结构参数通常需要其他 optimizer 处理。
+5. **K3 的独立收益仍未被充分证明。** 报告给出了合理的机制动机，但没有公开完整的 AdamW / full-Muon / Per-Head-Muon 三方 ablation。
+
+因此，最准确的结论是：
+
+> **Newton–Schulz orthogonalization 把“矩阵更新的方向”和“各方向的强度”分离：保留前者，压平后者。它的潜在收益是让矩阵参数更充分、更均衡地利用可学习子空间；K3 的 Per-Head 版本又把这种均衡从整个 Q/K/V projection 细化到每个 attention head。**
+
+#### 5.17 用一句伪代码把整个过程串起来
+
+```python
+# W: 一个 attention projection matrix
+# g: 当前 minibatch 对 W 的梯度，shape 与 W 相同
+# m: W 专属的 momentum buffer，shape 与 W 相同
+
+m = beta * m + (1 - beta) * g
+
+# full Muon:
+u = newton_schulz_polar(m)
+W = W - lr * u
+
+# Per-Head Muon:
+for h in heads:
+    m_h = split_by_head(m, h)
+    u_h = newton_schulz_polar(m_h)
+    u = concat_by_head(u_h)
+W = W - lr * u
+```
+
+最终要记住三层关系：
+
+```text
+W：模型正在学习的矩阵参数
+g：当前 batch 对 W 的矩阵梯度
+m：g 的时间平滑矩阵
+polar(m)：保留矩阵更新方向、压平奇异值尺度后的更新方向
+```
+
+#### 5.18 对前述解释的一个必要校正
+
+把 Newton–Schulz 写成：
+
+$$
+X_{k+1}
+=
+\frac12X_k(3I-X_k^\top X_k)
+$$
+
+是为了说明“为什么它会把奇异值推向 1”的标准教学版本；K3 实际采用的 Muon 具体多项式、迭代步数、转置方向、数值精度和 update scale 需要以实现为准。官方 Muon 实现使用 quintic 迭代，并明确说明有限步结果并非精确的 $UV^\top$。[Muon 官方代码](https://github.com/KellerJordan/Muon/blob/master/muon.py)
+
+因此，本文中：
+
+$$
+\operatorname{orth}(m)\approx UV^\top
+$$
+
+表示 **exact polar orthogonalization 的理想化解释**，不是说 K3 每一步真的计算了 SVD，也不是说实际 update 的每个奇异值都严格等于 1。
+
+关于收益，也要区分“机制解释”和“已被 K3 单独证明的收益”：
+
+- Muon 的矩阵正交化、weight decay 和 update scale 设计已有针对大模型训练的独立研究；
+- 相关 scaling-law 实验报告了相对 AdamW 的计算效率优势，但那是特定模型、数据和超参数下的实证，不应直接当作 K3 的独立 ablation 结论；
+- 最新理论工作分析了有限步 Newton–Schulz 如何逼近 exact-polar 理想化，以及其相对 momentum SGD 的 rank dependence，但这仍然不能替代 K3 自己的 full-Muon / Per-Head-Muon 对照实验。[Muon is Scalable for LLM Training](https://arxiv.org/abs/2502.16982)；[Convergence of Muon with Newton–Schulz](https://arxiv.org/abs/2601.19156)
+
+#### 5.19 本轮追问：$g_t$ / $m_t$ 的矩阵形状与 Newton–Schulz 的真实作用
+
+##### 1. 先抓住核心
+
+$$
+\boxed{
+W\text{ 是什么形状，}\;
+\nabla_W\mathcal{L}\text{、momentum buffer、Muon update 就首先是什么形状}
+}
+$$
+
+讨论 K3 的 Q/K/V projection 时，参数本身是矩阵，因此：
+
+$$
+W\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}
+$$
+
+其梯度：
+
+$$
+g_t
+=
+\nabla_W\mathcal{L}_t
+\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}
+$$
+
+其 momentum：
+
+$$
+m_t
+=
+\beta m_{t-1}+(1-\beta)g_t
+\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}
+$$
+
+所以 $m_t$ 不是一个“动量标量”，而是**每一个矩阵权重位置各自保存的历史梯度平滑值**。
+
+另外，K3 里有两个同名的 $g_t$：
+
+- 优化器里的 $g_t$：gradient；
+- KDA 里的 $g_t$：log-decay。
+
+它们只是符号碰巧相同，不能混为一谈。
+
+##### 2. 为什么 $g_t$ 是矩阵
+
+考虑一个线性层：
+
+$$
+y=Wx
+$$
+
+其中：
+
+$$
+W\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}},
+\quad
+x\in\mathbb{R}^{d_{\mathrm{in}}},
+\quad
+\delta=\frac{\partial\mathcal{L}}{\partial y}
+\in\mathbb{R}^{d_{\mathrm{out}}}
+$$
+
+反向传播给出的矩阵梯度是：
+
+$$
+g
+=
+\nabla_W\mathcal{L}
+=
+\delta x^\top
+\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}
+$$
+
+第 $i,j$ 个元素为：
+
+$$
+g_{ij}
+=
+\frac{\partial\mathcal{L}}{\partial W_{ij}}
+$$
+
+也就是：
+
+> **每一个权重 $W_{ij}$ 都有一个对应的偏导数 $g_{ij}$，所以把所有偏导数按原来的权重布局排起来，得到的就是梯度矩阵。**
+
+对 batch，若将输入样本按列堆成 $X$、上游梯度按列堆成 $\Delta$，则：
+
+$$
+G
+=
+\frac{1}{B}\Delta X^\top
+$$
+
+仍然和 $W$ 同形状。不同框架若将 token 放在行上，公式会写成 $\Delta^\top X$；形状结论不变。
+
+以 K3 的 Q projection 为例：
+
+$$
+W_q\in\mathbb{R}^{(96\times128)\times7168}
+=\mathbb{R}^{12288\times7168}
+$$
+
+因此：
+
+$$
+g_t,\;m_t
+\in\mathbb{R}^{12288\times7168}
+$$
+
+按 head 切分后，第 $h$ 个 head 的局部矩阵是：
+
+$$
+W_q^{(h)},\;g_t^{(h)},\;m_t^{(h)}
+\in\mathbb{R}^{128\times7168}
+$$
+
+##### 3. 为什么 $m_t$ 也是矩阵
+
+把 momentum 公式逐元素展开：
+
+$$
+(m_t)_{ij}
+=
+\beta(m_{t-1})_{ij}
++
+(1-\beta)(g_t)_{ij}
+$$
+
+所以每一个位置 $(i,j)$ 都有自己的历史平均：
+
+```text
+m[0, 0]：W[0, 0] 的历史梯度平滑值
+m[0, 1]：W[0, 1] 的历史梯度平滑值
+...
+m[i, j]：W[i, j] 的历史梯度平滑值
+```
+
+矩阵形式只是把这些标量状态保留在和参数相同的二维布局中。$\beta$ 通常是一个共享的标量超参数；它不是把整个矩阵压成一个数。
+
+因此，优化器状态的层级是：
+
+```text
+W：模型参数矩阵
+g：当前 batch 对 W 的梯度矩阵
+m：g 的指数滑动平均矩阵
+U：对 m 做矩阵级变换后的 update 矩阵
+```
+
+##### 4. Newton–Schulz 到底在做什么
+
+设当前要处理的矩阵更新为 $M$。做 SVD：
+
+$$
+M=U\Sigma V^\top
+$$
+
+其中：
+
+- $U,V$ 描述更新作用的输入 / 输出方向；
+- $\Sigma$ 描述各个方向的更新强度。
+
+普通 momentum 直接使用：
+
+$$
+\Delta W\propto M=U\Sigma V^\top
+$$
+
+如果 $\Sigma$ 很不均衡，例如：
+
+$$
+\Sigma=\operatorname{diag}(10,1,0.1)
+$$
+
+那么第一个奇异方向会获得约 10 倍于第二个方向的更新强度。
+
+理想化的 polar orthogonalization 想得到：
+
+$$
+Q=UV^\top
+$$
+
+也就是：
+
+- 保留“沿哪些输入 / 输出方向更新”；
+- 去掉奇异值 $\Sigma$ 对方向之间的巨大幅度差异。
+
+因此可以把它理解为：
+
+> **Newton–Schulz 不是在寻找新的梯度方向，而是在重塑同一组矩阵方向的相对更新强度。**
+
+##### 5. 它为什么叫 orthogonalization
+
+对方阵，$Q=UV^\top$ 满足：
+
+$$
+Q^\top Q=I
+$$
+
+对 K3 的 per-head Q/K/V block，矩阵是 $128\times7168$，属于宽矩阵。理想化情况下更准确的关系是：
+
+$$
+QQ^\top=I_{128}
+$$
+
+这表示每个 head 的 128 个输出方向在更新矩阵里被整理成近似正交、近似等尺度的方向。
+
+严格说，长方形矩阵对应的是 partial isometry；“orthogonalization”是工程上更简洁的说法，不代表它是方阵意义上的正交矩阵。
+
+##### 6. Newton–Schulz 如何实现这个目标
+
+教学上常用的 cubic 版本是：
+
+$$
+X_0=\frac{M}{s}
+$$
+
+$$
+X_{k+1}
+=
+\frac12X_k(3I-X_k^\top X_k)
+$$
+
+若：
+
+$$
+X_k=U\Sigma_kV^\top
+$$
+
+则 $U,V$ 基本不变，奇异值逐个经过：
+
+$$
+\sigma_{k+1}
+=
+\frac12\sigma_k(3-\sigma_k^2)
+$$
+
+该标量迭代会把合适区间内的 $\sigma_k$ 推向 1，于是：
+
+$$
+X_k\rightarrow UV^\top
+$$
+
+更底层的目标是近似 polar factor：
+
+$$
+\operatorname{polar}(M)
+=
+M(M^\top M)^{-1/2}
+$$
+
+对于宽矩阵，可用等价的左侧形式。Newton–Schulz 的价值在于：不显式做 SVD 或矩阵平方根，而是用若干次矩阵乘法逼近它。
+
+##### 7. Muon 实际并不精确计算 $UV^\top$
+
+这里必须修正一个容易被教学公式误导的点：
+
+> **标准 cubic 迭代可以收敛到理想化的 polar factor，但官方 Muon 实现使用有限步的 quintic Newton–Schulz，不追求每个奇异值精确收敛到 1。**
+
+官方实现先对矩阵做缩放，然后使用 quintic 多项式迭代：
+
+$$
+X\leftarrow aX+b(XX^\top)X+c(XX^\top)^2X
+$$
+
+代码中的一组系数为：
+
+$$
+a=3.4445,\qquad b=-4.7750,\qquad c=2.0315
+$$
+
+官方代码明确说明：有限步输出更接近 $US'V^\top$，其中 $S'$ 的奇异值大致落在有限区间，而不是严格等于 1；它是一个**近似的、工程化的 zeroth-power / orthogonalized update**。[Muon 官方实现](https://github.com/KellerJordan/Muon/blob/master/muon.py)
+
+所以前面写：
+
+$$
+\operatorname{orth}(M)\approx UV^\top
+$$
+
+应理解为**理想化解释**，不是说实际训练每一步都运行了一次精确 SVD。
+
+##### 8. 一个最小例子
+
+假设：
+
+$$
+M=
+\begin{bmatrix}
+10&0\\
+0&1
+\end{bmatrix}
+$$
+
+直接使用 $M$：
+
+```text
+方向 1：更新强度 10
+方向 2：更新强度 1
+```
+
+第一个方向主导更新。
+
+理想化 polar factor：
+
+$$
+M=I
+\begin{bmatrix}
+10&0\\
+0&1
+\end{bmatrix}
+I
+$$
+
+所以：
+
+$$
+\operatorname{polar}(M)=I
+$$
+
+这保留了两个坐标方向，但不让第一个方向因为奇异值是 10 就获得 10 倍更新。
+
+注意，单纯做全局 Frobenius 归一化：
+
+$$
+\widehat M=\frac{M}{\|M\|_F}
+$$
+
+只能把整体缩小，奇异值比例仍是 $10:1$。它解决的是“整张矩阵太大”，不是“不同矩阵方向之间过度不均衡”。
+
+##### 9. 为什么要这样做
+
+收益不是“梯度变得更正确”，而是引入一种矩阵级更新偏置：
+
+1. **防止少数奇异方向吞掉更新预算。** 大方向不会仅凭更大的 singular value 就独占绝大部分 update。
+2. **保留矩阵子空间结构。** Muon 不是把矩阵 flatten 成一条向量，而是在矩阵的奇异方向上处理更新。
+3. **与线性层 / attention projection 的几何更匹配。** Q/K/V 本来就是把输入子空间映射到输出子空间，矩阵级处理比逐 scalar 归一化更直接。
+4. **为 Per-Head Muon 提供局部均衡。** 每个 head 单独正交化后，各 head 不再共享一个跨 block 的全局谱竞争环境。
+5. **工程上可用 GEMM 近似，不需要每一步跑 SVD。** 官方实现将 Newton–Schulz 描述为 GPU 上可稳定运行的矩阵正交化路径，并且只建议对 hidden weight matrices 使用 Muon，embedding、输出头、bias 和 norm gain 等参数仍使用其他优化器。[Muon 官方实现](https://github.com/KellerJordan/Muon/blob/master/muon.py)
+
+##### 10. Per-Head 版本为什么比 full-matrix 更符合 K3
+
+完整投影矩阵：
+
+$$
+M=
+\begin{bmatrix}
+M^{(1)}\\
+\vdots\\
+M^{(96)}
+\end{bmatrix}
+$$
+
+如果整体正交化，它主要约束整张矩阵的全局列 / 行空间；某些 head 仍可能在整体矩阵中占据更大的更新尺度。
+
+如果每个 head 独立处理：
+
+$$
+Q_h=\operatorname{NS}(M^{(h)})
+$$
+
+则每个 head 在自己的局部矩阵空间里完成谱整理。对于理想化的 $128\times7168$ block：
+
+$$
+Q_hQ_h^\top=I_{128}
+$$
+
+从而：
+
+$$
+\|Q_h\|_F^2
+=
+\operatorname{tr}(Q_hQ_h^\top)
+=128
+$$
+
+这解释了“per-head equalizes update scale”的数学直觉：不是把每个 scalar 设成一样，而是让每个同形状 head 的局部更新矩阵具有相近的整体尺度。
+
+##### 11. 代价与边界
+
+这个方法不是无条件优越：
+
+- 它会削弱原始梯度中的奇异值幅度信息；
+- 很小的奇异方向可能是噪声，也可能是尚未学会的有用子空间，正交化无法自动区分；
+- 需要配合正确的学习率 / update scale 和 weight decay；
+- 并非所有参数都适合 Muon；
+- K3 报告没有公开 full-Matrix Muon、Per-Head Muon、AdamW 的完整三方 ablation。
+
+因此必须区分：
+
+```text
+机制收益：让矩阵更新的方向得到更均衡的机会
+实证收益：是否更快收敛、是否更低 loss、是否更强 benchmark
+```
+
+后者不能只由公式推出。独立的 Moonlight 研究报告，在特定 scaling-law 实验中声称 Muon 相对 AdamW 约有 2× computational efficiency；但那不是 K3 对 Per-Head Muon 独立贡献的证明，且该研究同时强调 weight decay 和 per-parameter update scale 对扩展到大模型很关键。[Muon is Scalable for LLM Training](https://arxiv.org/abs/2502.16982)
+
+##### 12. 最短记忆版
+
+```text
+W：要学习的矩阵
+g_t：当前 batch 对 W 的矩阵梯度
+m_t：g_t 的时间平滑矩阵
+
+普通 momentum：
+    直接用 m_t 更新，奇异值大的方向更新更强
+
+Newton–Schulz：
+    不改变主要奇异向量方向
+    通过矩阵多项式把奇异值谱压到更均衡的范围
+
+Per-Head Muon：
+    不对整个 Q/K/V projection 一锅端
+    而是每个 attention head 单独做这件事
+```
 
 ---
 
 ## 预训练
+
+### 3.3 Training Recipe：让架构真正学出来
+
+这一节的本质不是介绍新模块，而是说明：**K3 如何把原生多模态架构训练成一个统一模型。**
+
+核心做法有四点：
+
+1. **从一开始联合训练视觉和语言**：图像、视频与文本 token 交错进入同一个 backbone，共同优化 next-token prediction，而不是先训练语言模型、再外挂视觉塔做事后对齐。核心目标是让视觉表示从一开始就服从语言与任务目标。
+2. **用与架构匹配的优化稳定机制**：Per-Head Muon 处理 attention 矩阵更新，weight clipping 控制权重异常，Quantile Balancing 保证 MoE 专家负载均衡。
+3. **采用保守的学习率配方**：cosine decay、1% linear warmup、weight decay = 0.1，控制 2.8T 参数模型的训练动态。
+4. **逐步增加上下文长度**：先以 8K token 训练，后续扩展到 64K；更长的 256K → 1M curriculum 属于 §3.4 的 long-context extension。
+
+一句话概括：
+
+> **§3.3 解决的不是“模型能不能表达”，而是“视觉、语言、稀疏专家和注意力子空间能不能在同一套训练动力学下稳定形成”。**
+
+其中最重要的是第一点：K3 把多模态融合从“后处理对齐问题”改成了“从训练第一天就共同学习的问题”；其余配置则是在保证这个超大、稀疏、长上下文系统不失稳。
 
 ### 数据
 
@@ -198,11 +1573,136 @@ K3 的关键不是单纯“把专家数量从 384/256 增加到 896”，而是�
 - 对比 Kimi K2: **cosine decay 优于 WSD** (在各自最优超参数下)
 - 结论: 累积改进带来 2.5x 缩放效率提升
 
-### 长上下文扩展
+### 3.4 Long-Context Extension：如何做到 1M 窗口
 
-- 四阶段课程: 8K → 64K (预训练) → 256K → 1M (cooldown)
-- NoPE 避免了 RoPE 缩放, 直接外推到 1M
-- 合成长上下文数据: 排列拼接多模态文档和子任务, 迫使 attention 在 1M 尺度上运作
+> 长上下文各模型路线的系统横向对比见：[[Long Context：从1M窗口到有效长程能力]]
+
+#### 先给结论
+
+K3 的 1M context 不是靠某一个“超长位置编码技巧”实现的，而是同时解决了三个问题：
+
+```text
+架构：能不能处理 1M token
+数据：模型有没有学会使用远处信息
+系统：训练 1M token 是否负担得起
+```
+
+#### 1. 架构：NoPE + KDA 让长上下文在机制上可扩展
+
+K3 的 MLA 层不使用显式 positional embedding（NoPE），位置和 recency 信息主要由 KDA 的递归 state、channel-wise decay 和 input-dependent gate 隐式编码：
+
+$$
+S_t=M_tS_{t-1}+\beta_tk_tv_t^\top
+$$
+
+其中 $S_t$ 是固定大小的 recurrent state，不随历史长度 $t$ 线性增长。这样做的直接收益是：
+
+- 不需要为 1M context 重新调 RoPE frequency base；
+- 不需要做 RoPE interpolation / YaRN；
+- KDA 的状态大小主要由 head dimension 决定，而不是由 token 数决定；
+- KDA 可以承担大多数序列混合，避免所有层都执行标准全局 attention。
+
+K3 使用约 3:1 的 KDA : Gated MLA：
+
+```text
+KDA → KDA → KDA → Gated MLA → ...
+```
+
+- KDA：以固定大小的递归状态高效处理长序列、recency 和状态记忆；
+- Gated MLA：周期性提供全局内容检索，避免线性 attention 只依赖压缩状态而丢失精确远程信息。
+
+但要严谨：**KDA 不是让整个模型完全变成线性复杂度**。Gated MLA 仍然承担全局 attention 成本；K3 的策略是让大多数层走便宜的 KDA，少数层保留全局检索能力。
+
+NoPE 解决的是“位置编码如何外推”；KDA 解决的是“历史信息如何以固定状态持续传递”。二者结合，才使 1M extension 在架构上可行。
+
+#### 2. 数据：让模型真的必须跨越 1M 取信息
+
+“输入长度支持 1M”不等于“模型会使用 1M”。如果训练样本中的答案总在局部上下文里，模型会学会局部 shortcut，即使上下文窗口标成 1M，也不会真正检索远处内容。
+
+因此 K3 做了三件事：
+
+1. 清理自然长文档和视频：去重、质量过滤、结构校验、视频 frame perceptual hashing，去除截断文件、二进制垃圾和低质量日志；
+2. 对稀缺的长且连贯的数据进行 upsample，避免它们被海量短文本淹没；
+3. 合成超长多模态样本：排列、拼接多个文档和子任务，使任务所需信息分散在整个 1M context 中，只有跨远距离检索才能完成。
+
+核心不是“把序列塞到 1M”，而是：
+
+> **把监督信号放到 1M 的距离上，迫使模型学习跨长距离取证。**
+
+#### 3. 训练：渐进式扩大窗口，而不是一开始就训练 1M
+
+K3 使用四阶段 context curriculum：
+
+$$
+8K\rightarrow64K\rightarrow256K\rightarrow1M
+$$
+
+其中：
+
+- 8K → 64K：在常规预训练阶段逐步扩展；
+- 256K → 1M：在 cooldown 阶段进行长上下文适应。
+
+原因很现实：1M 序列的计算、显存和通信成本极高，不能让全部训练 token 都使用 1M。K3 将昂贵的超长序列训练集中在训练后段的一小部分预算里：
+
+```text
+先学通用语言能力
+    ↓
+再适应更长的依赖
+    ↓
+最后用少量 1M 训练校准长程行为
+```
+
+这同时解决两个问题：
+
+- 训练成本可控；
+- 模型从短依赖逐步过渡到长依赖，不会一开始就面对极端优化难度。
+
+#### 4. 系统：KCP 把 1M 序列切到多个设备上
+
+即使 KDA 使用固定大小 state，1M token 的激活、梯度和计算仍然很重。因此 K3 在 §5.1.2 使用 KDA Context Parallelism（KCP）。
+
+将序列切成 $P$ 个 segment，每个 rank 处理一个 segment。每个 rank 不传输完整历史 KV，而是本地计算两个固定规模对象：
+
+1. **cumulative transition**：当前 segment 对输入 state 的变换；
+2. **zero-state contribution**：从零 state 开始、由当前 segment 自己产生的 state。
+
+对第 $i$ 个 segment，可抽象为：
+
+$$
+S_{\text{out}}^{(i)}
+=
+\widetilde S^{(i)}
++
+M^{(i)}S_{\text{in}}^{(i)}
+$$
+
+其中：
+
+- $M^{(i)}$：该 segment 的累计状态转移；
+- $\widetilde S^{(i)}$：该 segment 从零状态产生的局部内容；
+- $S_{\text{in}}^{(i)}$：该 segment 接收到的历史 state。
+
+各 rank 通过一次 all-gather 交换这些固定大小的 $M^{(i)}$ 和 $\widetilde S^{(i)}$，再用 prefix scan 恢复每个 segment 的输入 state。
+
+关键点是：KDA 的 delta update 不是简单加法，不能像普通 linear attention 那样直接把各段 state 相加；KCP 显式保留“状态转移 + 局部写入”，所以可以精确重建跨 segment 的递归结果。
+
+因此通信传递的是固定大小的 state fragments，而不是随 1M token 增长的完整 KV blocks。这让 KDA 的长序列训练可以扩展到多个设备。
+
+#### 5. 1M window 与 1M capability 不是一回事
+
+K3 做到的是三层意义上的“1M”：
+
+| 层次 | 含义 |
+| --- | --- |
+| 架构支持 | 模型可以接收并处理最多 1M token |
+| 训练适配 | 模型在 256K → 1M 阶段见过长程依赖 |
+| 能力形成 | 合成数据迫使模型从整个 1M 范围检索信息 |
+
+所以：
+
+> **NoPE 让位置机制不因长度扩展而失效；KDA 让大多数序列处理成本可控；长上下文数据让模型学会使用远处信息；渐进式 curriculum 和 KCP 让训练这件事负担得起。**
+
+这四个部分缺一不可。只改 RoPE，得到的只是“能输入更长”；只改 KDA，得到的只是“更便宜地处理长序列”；只有架构、数据、训练和系统共同配合，才可能得到真正可用的 1M context。
 
 ### 架构对比 (K2 vs K3)
 
