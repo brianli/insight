@@ -3,6 +3,7 @@ title: Agentic RL 涌现 — 参考资料与学习路径
 tags: [rl, emergence, agent, reading_list, education]
 created: 2026-07-29
 related:
+  - "[[Agentic RL：总体范式、主流模型与方法对比]]"
   - "[[K3 规划与工具使用 — 从 Agentic RL 中涌现]]"
   - "[[K3 Agent 能力全景]]"
   - "[[Agentic RL Survey 论文精读笔记]]"

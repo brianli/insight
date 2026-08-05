@@ -1722,41 +1722,450 @@ K3 做到的是三层意义上的“1M”：
 
 ## Post-Training
 
-### 三阶段范式
+Agentic RL 的独立综述、主流模型路线与方法对比见 [[Agentic RL：总体范式、主流模型与方法对比]]。
 
+### 本节所要解决的问题
+
+Post-Training 的目标并非一般意义上的“对齐”或“指令跟随增强”，而是将一个已经具备大规模知识与基础推理能力的预训练模型，进一步塑造成能够在百万级上下文中长期执行任务、根据预算调整推理强度、跨领域完成工作的单一 Agent，并使其行为适应实际部署中的精度、延迟与成本约束。
+
+因此，本节的核心问题可以表述为：
+
+> **如何把预训练得到的能力转化为可执行、可验证、可调成本，并最终可部署的 Agent 策略。**
+
+### 总体训练链
+
+K3 的 Post-Training 采用如下三阶段范式：
+
+```text
+预训练基座
+    ↓
+SFT：建立可探索的 Agent 冷启动策略
+    ↓
+Domain-specific RL：按任务领域和推理预算训练专门策略
+    ↓
+MOPD：将专门策略统一到单一模型
+    ↓
+QAT + EAGLE-3：使训练结果适应部署约束并降低推理成本
 ```
-SFT → Domain-specific RL (3 domains × 3 effort levels = 9 experts) → MOPD 蒸馏统一
+
+其中，`4.1 Method` 负责说明策略如何被初始化、优化和合并；`4.2 RL Task Synthesis and Agentic Environments` 负责说明任务、环境与奖励信号如何被构造。二者共同构成 Agentic RL 的闭环。
+
+实际训练过程并不是严格的一次性流水线，而是：
+
+```text
+构造任务与环境
+    ↓
+模型 rollout
+    ↓
+执行结果、验证器反馈与 reward
+    ↓
+策略更新
+    ↓
+暴露新的失败模式
+    └────────→ 继续改进任务、环境与 verifier
 ```
 
-### RL 三域
+报告采用“先讲方法、后讲任务与环境”的顺序，主要是为了先建立策略优化的抽象主线，再解释训练信号的来源。该顺序是论文叙事顺序，不等同于实际研发中的时间顺序。
 
-- **General**: 搜索、知识、推理、视觉
-- **General Agents**: 长时助手、深度研究、专业写作
-- **Coding Agents**: SWE、kernel、web 开发
+### 4.1.1 SFT：建立 Agent 的冷启动策略
 
-三个推理努力等级: low / high / max
+SFT 在 K3 中的主要作用不是直接获得最终能力，而是为后续 RL 提供一个高质量的初始策略。预训练模型虽然掌握了大量知识和语言生成能力，但并不天然具备以下行为：
 
-### 关键算法
+- 正确理解并调用工具；
+- 将复杂目标拆分为多个可执行步骤；
+- 读取工具返回并据此调整后续行动；
+- 在长程任务中保持状态并完成交付；
+- 在失败后进行恢复，而不是直接终止。
 
-- **Partial Rollout**: 前 λ 比例轨迹完成即触发策略优化, 未完成的在下轮恢复。通过 token 级正则化容忍极端 off-policy staleness。
-- **Reasoning Effort Budget Control**: 每道题目设定初始 budget $b_0(x)$, 超限轨迹 reward = -1。
-- **Agentic GRM**: Agentic 方式执行评判: read outcome → generate rubric → score → record scorepad。加 output length budget 防止 reward hacking。
+因此，K3 的 SFT 数据重点覆盖复杂的 Agent trajectory。数据由此前 Kimi 系列中的领域专门模型生成，经过多阶段验证和人工参与标注，再通过 XTML-based chat template 统一序列化。XTML 的意义在于，将用户输入、模型输出、思考过程、工具调用、工具返回和多模态观察等不同交互类型编码为一致的训练结构，使复杂 Agent 交互能够转化为统一的 token-level learning problem。
 
-### MOPD (Multi-Teacher On-Policy Distillation)
+SFT 的功能可以概括为：
 
-多域多 effort 的 9 个专家模型, 通过 on-policy distillation 蒸馏为单一模型。reward 为:
+```text
+预训练模型的知识与推理能力
+    +
+基本的工具使用与执行轨迹
+    ↓
+具备可探索性的 Agent 初始策略
+```
 
-$$r_{\text{opd}}(y_t) = \text{clip}\left(\log\frac{\pi_{\text{teacher}}(y_t)}{\pi_\theta(y_t)}, -R_{\max}, R_{\max}\right)$$
+如果跳过这一步，直接对复杂长程任务进行 RL，模型往往会产生大量无效探索：工具格式错误、过早终止、行动与目标脱节，以及极其稀疏的有效 reward。SFT 因此承担的是“建立可探索行为分布”的作用，而不是简单模仿最终答案。
 
-### 量化
+### 4.1.2 RL：按领域与推理预算进行专业化训练
 
-- MoE expert 权重 → MXFP4, 激活 → MXFP8
-- 从 SFT 阶段即开始 QAT, RL rollout 和 training 共享量化方案
+SFT 提供冷启动基础，RL 则用于进一步获得高阶推理与执行能力。K3 没有将所有任务混合为一个单一 RL 专家，而是沿两个维度进行拆分。
 
-### Decoding 加速
+#### 三个任务领域
 
-- 将 MTP 层 fine-tune 为 EAGLE-3 draft model
-- 直接优化 $L_{\text{LK}}$ loss (acceptance rate), 而非 KL-divergence
+| 领域 | 任务范围 | 主要能力 |
+|---|---|---|
+| `General Tasks` | 通用经验、视觉、推理、faithfulness、搜索、知识工作 | 广泛的认知与判断能力 |
+| `General Agents` | 长时助手、深度研究、段落级写作 | 长程规划、工具使用与交付 |
+| `Coding Agents` | SWE、coding experience、kernel、web development | 软件工程、GPU kernel 与应用开发 |
+
+#### 三个推理努力等级
+
+```text
+low / high / max
+```
+
+两个维度交叉后得到：
+
+```text
+3 个领域 × 3 个推理努力等级 = 9 个专家模型
+```
+
+这种拆分同时处理两个冲突。
+
+第一，**专业化能力与多任务负迁移之间的冲突**。知识、长程 Agent 和代码执行具有不同的任务结构与 reward 定义。如果完全使用一个 RL objective，某一领域的行为偏好可能干扰其他领域。例如，代码任务强调可运行性与性能，知识任务强调事实性，长程 Agent 任务则强调状态跟踪与最终交付。先训练领域专家，可以让不同能力在各自的 reward landscape 中充分优化。
+
+第二，**结果质量与推理成本之间的冲突**。`max`、`high` 和 `low` 并不只是质量等级，而是不同的质量—成本工作点：
+
+- `max`：允许较高推理与执行预算，追求更高成功率；
+- `high`：在质量与成本之间取得平衡；
+- `low`：减少思考 token、工具调用与延迟，适合成本敏感场景。
+
+对于长程 Agent，额外的推理并不只意味着更多输出 token，还会增加工具调用次数、环境执行成本、上下文长度以及 KV cache 占用。因此，推理努力等级是一个需要显式训练的策略变量，而不是仅在推理阶段通过提示词控制的表面参数。
+
+#### Partial Rollout：处理长程轨迹的尾部延迟
+
+传统同步 RL 往往需要等待一个 batch 中的全部 rollout 完成后再更新策略。然而，长程 Agent 轨迹的长度差异很大，少数极慢轨迹会拖延整个训练 iteration。
+
+K3 的 Partial Rollout 机制为每轮维护 $N\times K$ 条活跃轨迹。当完成比例达到 $\lambda$ 后，即先对已完成的轨迹进行策略优化；尚未完成的轨迹被暂停，并在下一轮开始时恢复：
+
+```text
+启动 N × K 条轨迹
+    ↓
+完成 λN K 条轨迹
+    ↓
+立即进行策略优化
+    ↓
+暂停的轨迹进入队列
+    ↓
+下一轮恢复执行
+```
+
+该机制降低了长程任务的尾部延迟，但也产生了新的稳定性问题：单条轨迹可能跨越多个 iteration，导致训练数据出现明显的 staleness，并进入更强的 off-policy regime。K3 通过 per-token regularization 限制策略更新幅度，使优化能够容忍这类陈旧数据。
+
+这表明 K3 的 RL 设计首先受到长程 Agent 场景的系统约束，然后再对优化算法进行适配；它不是脱离执行系统而独立设计的纯算法方案。
+
+#### Reasoning Effort RL：控制推理预算
+
+K3 为每个问题 $x$ 估计一个初始 token budget $b_0(x)$。对于一条轨迹 $y$，如果其总 token 数超过预算阈值：
+
+$$
+T(y) > \tau b_0(x)
+$$
+
+则将该轨迹的任务 reward 覆盖为 $-1$。其中，$\tau$ 是预算倍率；通用任务中的 $T(y)$ 主要衡量 thinking tokens，Agent 任务中的 $T(y)$ 则包括思考过程与工具调用参数在内的累计输出 token。
+
+训练采用阶段式 curriculum：
+
+```text
+较大的 τ → 训练 max-effort 专家
+逐步降低 τ → 训练 high-effort 专家
+进一步降低 τ → 训练 low-effort 专家
+```
+
+该机制的作用有二：
+
+1. 防止模型通过无限延长思考或增加工具调用来获取不受约束的 reward；
+2. 将推理成本显式纳入策略学习，使模型形成多个可部署的质量—延迟工作点。
+
+#### Agentic GRM：为不可验证任务提供结构化奖励
+
+对于开放式知识工作、专业写作和复杂 Agent 交付物，通常不存在简单的 exact-match 答案。K3 因此采用 `Agentic Generative Reward Model`，但要求评判模型遵循固定协议：
+
+```text
+1. 阅读结果、产品或文本输出
+2. 生成评分 rubric
+3. 根据 rubric 评价每个候选结果
+4. 将 rubric 对应的分数写入 scorepad
+```
+
+该协议将“凭直觉打分”转化为较为结构化的评价过程。与此同时，K3 增加了类似 reasoning-effort control 的 verbosity budget：如果候选输出长度超过基准长度的指定倍数，则在二元比较中自动失败，以抑制模型通过无意义的冗长输出进行 reward hacking。
+
+### 4.1.3 MOPD：将专业化策略统一到单一模型
+
+如果只保留九个领域—努力等级专家，部署时就需要在多个模型之间进行路由；如果从一开始就训练一个统一模型，又容易产生领域之间的 reward interference。因此，K3 采用“训练时专业化、部署时统一化”的路径：
+
+```text
+3 domains × 3 effort levels
+    ↓
+9 个专门策略
+    ↓
+Multi-Teacher On-Policy Distillation
+    ↓
+一个统一模型
+```
+
+`MOPD` 的核心不是权重平均，也不是将九个模型简单压缩为一个模型，而是在 student 自己的 on-policy trajectory 上，由与当前领域 $d$ 和努力等级 $e$ 对应的 teacher 提供 token-level guidance。
+
+对于输入 $x$、已有前缀 $y_{<t}$ 和当前 token $y_t$，报告给出的 per-token OPD reward 为：
+
+$$
+r_{\mathrm{opd}}^d(y_t\mid e,x,y_{<t})
+=
+\operatorname{clip}
+\left(
+\operatorname{sg}
+\log
+\frac{
+\pi_{\mathrm{teacher}}^{(d,e)}(y_t\mid x,y_{<t})
+}{
+\pi_\theta(y_t\mid e,x,y_{<t})
+},
+-R_{\max},R_{\max}
+\right)
+$$
+
+其中：
+
+- teacher 对某个 token 的偏好高于 student 时，该 token 获得正向指导；
+- `clip` 用于限制极端 advantage signal，稳定 RL 训练；
+- `sg` 表示 teacher 不参与反向传播；
+- on-policy 的含义是，teacher 指导的是 student 自己实际访问到的状态，而不是仅拟合 teacher 离线生成的轨迹。
+
+这一点对长程 Agent 尤其重要。student 在实际执行过程中可能偏离 teacher 的轨迹，离线蒸馏只能覆盖 teacher 的状态分布，而 MOPD 能够在 student 自己的行为分布上提供修正。报告还指出，该 dense reward 可以直接嵌入既有 RL 框架，并与 Partial Rollout 等长轨迹优化机制结合。
+
+### 4.1.4 Deployment-Aware Post-Training
+
+K3 将部署约束纳入 Post-Training，而不是在训练结束后再单独处理。这一安排有两个层面。
+
+#### MXFP4 Quantization-Aware Training
+
+MoE expert 权重占据了模型参数内存的主要部分。K3 将其量化为 `MXFP4`，输入激活使用 `MXFP8`；attention projections、latent MoE projections、shared experts 和 MoE routers 等非 expert 组件则保留更高精度。
+
+QAT 从 SFT 阶段开始，并贯穿整个 Post-Training，包括 SFT 和 RL。训练与 rollout 使用相同量化方案，从而避免：
+
+```text
+高精度训练与 rollout
+    ↓
+部署时突然切换为低精度
+    ↓
+模型概率分布、工具行为与策略稳定性发生变化
+```
+
+因此，`4.1.4` 虽然在章节顺序上位于 MOPD 之后，但它并不是严格意义上的最后一个训练阶段；QAT 实际上从 SFT 开始就参与训练。
+
+#### Draft Model Fine-Tuning
+
+K3 将预训练阶段的 MTP layer 微调为 `EAGLE-3` 风格的 draft model。target model 保持冻结，只更新 draft layer 与 feature-fusion projection。draft model 使用 target model 不同深度的特征，并通过 speculative decoding 提高生成速度。
+
+K3 没有以传统 KL divergence 作为主要目标，而是直接优化无损 speculative sampling 的 acceptance rate：
+
+$$
+L_{\mathrm{LK}}
+=
+-\log \sum_{x\in V}\min\bigl(p(x),q(x)\bigr)
+$$
+
+其中 $p$ 是 target model 的分布，$q$ 是 draft model 的分布。这样做的原因是：对于容量受限的 draft model，最小化 KL 并不等价于最大化实际 token acceptance rate；而后者才直接决定 speculative decoding 的加速效果。
+
+### 4.2 RL Task Synthesis and Agentic Environments
+
+Agentic RL 的瓶颈不仅是策略优化算法，还包括：
+
+```text
+高质量任务
++ 可执行环境
++ 可靠 verifier
++ 可扩展 reward
+```
+
+因此，4.2 不是对任务案例的简单罗列，而是在回答“RL 的训练信号如何被持续、可靠地供给”这一问题。
+
+#### Unified White-Box RL Environment
+
+如果始终使用单一 Agent harness，模型可能过拟合于固定的工具 schema、system prompt、上下文管理机制、memory、skills 或 subagent 结构，最终学到的是“适应该框架的方法”，而不是更一般的任务解决能力。
+
+K3 将 Agent harness 抽象为一组可配置、可组合的模块，并动态构造不同环境，使模型接触多种工具接口、提示词、上下文策略、技能和记忆机制。该设计的目标是提升跨 harness generalization。
+
+#### Knowledge-Graph-Guided Task Synthesis
+
+任务来源决定了 Post-Training 的质量与覆盖范围。纯随机生成或热门主题采样容易产生重复任务，也难以覆盖长尾专业知识。K3 因此构建自演化的层级知识图谱：
+
+```text
+粗粒度领域
+    ↓
+子领域
+    ↓
+细粒度概念
+    ↓
+原子知识点
+```
+
+系统从不同粒度的节点或相关节点组合中采样关键词，结合祖先节点的上下文信息检索真实材料，再由 synthesis agent 生成不同类型的训练任务。该过程同时控制：
+
+- 领域覆盖；
+- 知识粒度；
+- 长尾概念比例；
+- 真实材料 grounding；
+- 任务类型分布。
+
+#### Verifiable Problems in Agentic Environments
+
+K3 的任务设计重点从“生成看似合理的回答”转向“通过一系列动作使环境达到目标状态”。代表性任务包括：
+
+- 多步信息搜索与证据汇总；
+- 投资银行、数据分析、法律实践等专业工作流；
+- 使用 Python 工具进行裁剪、放大、变换和计算的视觉推理；
+- 需要多轮工具调用与中间结果验证的复杂任务。
+
+这些任务共同训练以下闭环：
+
+```text
+理解目标 → 制定计划 → 执行动作 → 观察结果 → 验证 → 调整
+```
+
+#### Kernel Optimization Tasks
+
+Kernel 任务覆盖 CUDA、Triton、CuTe DSL、Gluon、ThunderKittens 和 TileLang 等编程方式，以及 BF16、FP8 和 FP4 等数值格式。奖励同时评价：
+
+- 数值正确性；
+- 相对于 expert implementation 的性能；
+- 接近硬件 roofline 的程度；
+- 是否存在 CUDA graph replay、input caching、降低精度等 reward-hacking 行为。
+
+它训练的不是普通代码补全，而是：
+
+```text
+理解算子 → 编写 kernel → 运行验证 → 测量性能 → 迭代优化
+```
+
+#### Personal Assistant Tasks
+
+K3 构造 Gmail、Notion、Slack 和 Canvas 等应用的可复现模拟环境，并在多个模拟日期中持续推进事件流。单次 rollout 可能包含数千次工具调用和数百万 token 的上下文。
+
+该类任务主要训练：
+
+- 持久状态跟踪；
+- 跨应用协调；
+- 长期计划；
+- 事件驱动的行动；
+- 在持续变化的环境中维护一致性。
+
+这与单轮问答或短链工具调用有本质区别。
+
+#### Autonomous Execution Tasks
+
+`Autonomous Execution Tasks (AET)` 采用 verify-in-the-loop 的环境范式。每个任务只提供初始状态、目标、约束、工具动作空间、执行预算和独立 verifier，不提供参考轨迹或预定义程序。
+
+模型必须自主完成：
+
+```text
+任务分解 → 工具选择 → 规划 → 执行 → 错误恢复 → 终止
+```
+
+奖励依据 verifier 对最终环境状态的评价，而不是模型自我报告的完成状态。为降低 reward hacking 风险，K3 将 agent 与 verifier 隔离，并结合公开 verifier 的诊断反馈、隐藏 verifier 的 held-out evaluation 以及有限提交预算下的惩罚机制。
+
+#### Web Development Tasks
+
+Web development 任务覆盖网站、交互式游戏、3D/WebGL 场景、数据可视化、SVG 和全栈应用。每个任务在容器化 sandbox 中运行，并使用多种 Agent scaffold，以提升跨 scaffold 泛化能力。
+
+奖励由确定性检查与模型评价共同组成，包括：
+
+- 项目是否成功构建；
+- 应用是否正常运行；
+- 功能行为是否正确；
+- 结构与像素级相似度；
+- 源代码检查；
+- 对最终交互产物的观察与评价。
+
+这类任务形成了典型的工程闭环：
+
+```text
+需求理解 → 代码实现 → 构建运行 → 观察结果 → 修复 → 交付
+```
+
+### 第4部分的写作逻辑
+
+第4部分采用当前结构，主要有以下原因。
+
+#### 1. 先说明策略，再说明训练信号
+
+报告先给出：
+
+```text
+SFT → RL → MOPD
+```
+
+读者先获得 Post-Training 的抽象主线，再理解任务合成、环境配置和 verifier 如何为 RL 提供数据与 reward。若一开始直接介绍 knowledge graph、sandbox 和具体任务，容易陷入环境细节而无法把握训练目标。
+
+#### 2. 突出 K3 与传统对齐流水线的区别
+
+传统 Post-Training 常被概括为：
+
+```text
+SFT → preference optimization → safety alignment
+```
+
+K3 则将重点放在：
+
+```text
+SFT → long-horizon domain RL → verifiable environments → MOPD → deployment
+```
+
+这表明 K3 将 Post-Training 理解为 Agent policy engineering，而不仅是对话风格或偏好对齐。
+
+#### 3. 处理“专业化训练与统一部署”的矛盾
+
+多领域、多推理预算需要专业化策略；实际部署则希望使用一个统一模型。K3 因此先允许九个专家分别优化，再通过 MOPD 合并能力。MOPD 是整条逻辑链的闭合环节，缺少它，领域专家与最终产品之间就会存在明显断层。
+
+#### 4. 将长程 Agent RL 作为算法—系统协同问题
+
+当任务轨迹延伸到数百或数千次工具调用、甚至百万级上下文时，RL 已经不能仅靠策略梯度算法解决。Partial Rollout、KV cache 管理、可恢复 sandbox、动态并发控制和 verifier 隔离都成为训练闭环的一部分。第4节与第5节因此是相互衔接的：
+
+```text
+第4节：策略、任务、环境与 reward
+第5节：承载这些策略与环境的训练、rollout 和服务系统
+```
+
+#### 5. 将部署目标前置到训练阶段
+
+QAT 从 SFT 开始，RL rollout 与训练采用相同量化配置；EAGLE-3 则直接优化 token acceptance rate。报告由此强调，K3 的目标不是只在离线 benchmark 上得到高分，而是在真实推理成本下提供可用能力。
+
+### 第4部分的“问题—机制”对应关系
+
+| 要解决的问题 | 对应机制 |
+|---|---|
+| 预训练模型如何变成可执行 Agent | SFT cold-start policy |
+| 如何获得高阶推理与执行能力 | Domain-specific RL |
+| 如何控制推理成本 | Reasoning Effort Budget Control |
+| 如何处理不等长长程轨迹 | Partial Rollout |
+| 如何评价开放式交付物 | Agentic GRM |
+| 如何抑制冗长输出与环境投机 | Verbosity budget、anti-hacking verifier |
+| 如何将专家能力统一到一个模型 | MOPD |
+| 如何避免过拟合单一 Agent harness | Unified White-Box RL Environment |
+| 如何扩展任务覆盖与长尾知识 | Knowledge-Graph-Guided Task Synthesis |
+| 如何训练真实的环境交互能力 | Verifiable Problems、AET、Personal Assistant Tasks |
+| 如何使训练行为接近部署行为 | QAT |
+| 如何降低长程推理延迟 | EAGLE-3 draft model |
+
+### 需要避免的三种误读
+
+1. **不要将 `4.1.4 Deployment-Aware Post-Training` 理解为训练结束后的最后一步。** QAT 从 SFT 阶段开始，并持续覆盖 RL；该小节只是集中说明部署约束。
+2. **不要将 `4.2` 理解为方法完成后才开始构建环境。** 真实流程是任务、环境、rollout、verifier 和策略更新不断迭代；报告只是为了叙述清晰，将训练信号的来源单独放在后面说明。
+3. **不要将 MOPD 理解为九个模型的简单压缩或权重合并。** 它是在 student 自己的 on-policy 状态分布上，由对应 teacher 提供 token-level dense guidance 的策略统一过程。
+
+### 小结
+
+K3 Post-Training 的主张可以概括为：
+
+> **Agent 能力需要通过真实、长程、可验证的环境交互由 RL 写入策略；训练阶段可以按领域和推理预算进行专业化，部署阶段则通过 MOPD 统一为单一模型，并从训练早期开始纳入量化与推理成本约束。**
+
+因此，第4部分的结构不是单纯的算法分类，而是一条完整的因果链：
+
+```text
+能力目标
+    → 行为初始化
+    → 专门能力放大
+    → 推理成本控制
+    → 多专家统一
+    → 任务与 reward 供给
+    → reward hacking 防护
+    → 训练—部署一致性
+```
 
 ---
 

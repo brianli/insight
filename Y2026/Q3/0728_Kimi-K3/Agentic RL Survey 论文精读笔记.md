@@ -4,6 +4,7 @@ tags: [rl, agentic_rl, survey, emergence]
 source: "https://arxiv.org/abs/2509.02547"
 created: 2026-07-29
 related:
+  - "[[Agentic RL：总体范式、主流模型与方法对比]]"
   - "[[K3 规划与工具使用 — 从 Agentic RL 中涌现]]"
   - "[[Agentic RL 涌现 — 参考资料与学习路径]]"
 ---
