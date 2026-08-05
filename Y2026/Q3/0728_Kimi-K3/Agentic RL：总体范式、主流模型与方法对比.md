@@ -1403,6 +1403,57 @@ Agent 的行动能力越强，错误 reward 的后果越大。安全训练必须
 8. [OSWorld](https://arxiv.org/abs/2404.07972)
 9. [τ-bench](https://arxiv.org/abs/2406.12045)
 
+### 7.4 开源训练框架、Agent 环境与复现项目
+
+#### Reasoning RL：优先阅读
+
+| 项目 | 定位 | 适合学习什么 | 边界 |
+|---|---|---|---|
+| [`huggingface/open-r1`](https://github.com/huggingface/open-r1) | DeepSeek-R1 的开放复现项目 | `GRPO`、reasoning data generation、reward function、SFT→RL 流程 | 重点是 reasoning RL，不是完整长程 Agent 环境 |
+| [`verl-project/verl`](https://github.com/verl-project/verl) | 通用、生产级 LLM RL 框架 | actor/rollout 解耦、PPO/GRPO、HybridFlow、工具调用与多轮 rollout | 框架能力很广，单独阅读不等于掌握一个具体模型 recipe |
+| [`OpenRLHF/OpenRLHF`](https://github.com/OpenRLHF/OpenRLHF) | 基于 Ray 的高性能 RLHF/Agentic RL 框架 | PPO、GRPO、REINFORCE++、DAPO、异步 RL、多轮 Agent、VLM | 更偏通用工程框架，方法差异需要结合 examples 阅读 |
+| [`THUDM/slime`](https://github.com/THUDM/slime) | 连接 Megatron 与 SGLang 的 RL scaling 框架 | 大规模 rollout、reward/verifier dataflow、on-policy distillation、multi-agent RL | 更适合研究大规模系统，不是最短的入门代码 |
+| [`allenai/olmocr`](https://github.com/allenai/olmocr) | 文档 OCR 模型的开源训练项目 | 在真实任务上使用合成数据与 GRPO RL，理解“任务 verifier + 专门 RL” | 任务域是 OCR，不代表通用 reasoning RL |
+
+#### Agentic RL：优先阅读
+
+| 项目 | 定位 | 适合学习什么 | 边界 |
+|---|---|---|---|
+| [`microsoft/agent-lightning`](https://github.com/microsoft/agent-lightning) | 将已有 Agent 接入 RL/优化的通用训练层 | 从现有 Agent trace 重建 trajectory，几乎不改 Agent 代码，支持 SQL、WebShop、Claude Code 等例子 | 更偏 Agent 训练编排层；具体模型 policy optimizer 仍依赖后端 |
+| [`volcengine/verl`](https://github.com/volcengine/verl) 的 Agentic RL 能力 | 多轮 rollout、工具调用和异步训练框架 | 研究 search/tool/sandbox 类 Agentic RL 的训练—推理闭环 | 本身是底层框架，不是一个完整 Agent 产品 |
+| [`THUDM/slime`](https://github.com/THUDM/slime) 的 agent-first 路线 | 面向 multi-turn、tool、sandbox 和长程任务的 RL 框架 | 训练/rollout/data buffer/环境交互如何统一；异步训练与可恢复 trajectory | 需要一定 Megatron/SGLang 基础 |
+| [`ServiceNow/BrowserGym`](https://github.com/ServiceNow/BrowserGym) | Web Agent 的 Gym 风格环境与 benchmark 生态 | observation/action space、浏览器状态、任务注册、WebArena/WorkArena/MiniWoB 等环境 | 主要提供环境与评价，不是完整 policy-training framework |
+| [`SWE-agent/SWE-agent`](https://github.com/SWE-agent/SWE-agent) / [`mini-swe-agent`](https://github.com/SWE-agent/mini-swe-agent) | 软件工程 Agent harness | 终端/代码编辑接口、仓库级任务执行、测试反馈、SWE-bench 评估 | 默认是推理时 Agent；要做 Agentic RL 还需接入训练框架与 reward pipeline |
+| [`kvcache-ai/AgentENV`](https://github.com/kvcache-ai/AgentENV) | 面向大规模 Agentic RL 的 microVM 环境 | 强隔离、pause/resume、fork、snapshot、状态复用与高密度 rollout | 是执行环境基础设施，不负责 policy optimization |
+
+#### 为什么这些项目要分开看
+
+不能把上述项目都叫作“Reasoning RL 项目”或“Agentic RL 项目”。它们位于不同层：
+
+```text
+模型与算法：open-r1、verl、OpenRLHF、slime
+        ↓
+Agent 训练编排：Agent Lightning
+        ↓
+任务与环境：BrowserGym、SWE-agent、AgentENV
+        ↓
+Verifier / benchmark：SWE-bench、WebArena、WebShop、数学与代码测试
+```
+
+一个完整的 Agentic RL 实验通常需要把多层拼起来：
+
+```text
+Base/Reasoning Model
+    + Agent harness
+    + Environment
+    + Verifier / reward
+    + Rollout engine
+    + RL trainer
+    + Evaluation
+```
+
+如果只运行 `open-r1` 或 `verl` 的数学例子，学习到的是 reasoning RL；如果将 `verl`/`slime`/`Agent Lightning` 接到 BrowserGym、SWE-agent 或自建 sandbox，并根据环境状态计算 reward，才进入完整 Agentic RL。
+
 ### 7.4 长程 RL 与系统
 
 1. [Kimi K1.5](https://arxiv.org/abs/2501.12599)
