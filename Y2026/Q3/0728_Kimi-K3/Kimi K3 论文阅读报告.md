@@ -2171,46 +2171,1206 @@ K3 Post-Training 的主张可以概括为：
 
 ## 基础设施
 
-### KDA 系统协同设计
+### §5 学习逻辑：把架构和工作负载变成可执行系统
 
-- **FlashKDA**: CUTLASS 实现的 chunkwise kernel, 重叠 intra-chunk 计算与 cross-chunk state propagation
-- **KCP (KDA Context Parallelism)**: 利用 KDA 的线性循环特性, 每 rank 本地计算累积转移矩阵 $M_T$ 和局部状态 $\tilde{S}_T$, 一次 all-gather 后通过 prefix scan 恢复每个 rank 的入站状态。通信量不随序列长度增长。
+第 5 部分不是基础设施项目清单，而是沿着**模型生命周期**与**三类规模瓶颈**展开：
 
-### 3T 预训练基础设施
+```text
+架构带来的新计算模式
+        ↓
+如何把单卡 kernel 跑快、跨卡并行跑通
+        ↓
+如何支撑 3T 级预训练
+        ↓
+如何支撑 1M token Agentic RL
+        ↓
+如何转化为可预测的在线推理服务
+```
 
-- **MoonEP**: 完美负载均衡的 EP 方案。通过有界冗余 expert 将每 rank 的 token 负载固定为 $S \times K$, 实现静态计算形状, 消除 per-layer host 同步。ILP 规划 + GPU 在线近似规划。
-- **内存高效训练**: 统一 activation manager 抽象; FP8 量化 + offload; P2P Muon 正交化避免全参数 all-gather。
-- **多模态编码器优化**: 动态 CP + encoder 计算填充 pipeline bubble。
+一句话概括：
 
-### 1M Agentic RL
+> **K3 §5 解决的是：KDA、3T MoE、多模态、1M Agentic workload 这些架构和训练目标，如何被硬件真正承载，并最终以可控成本服务用户。**
 
-- **External KV Cache Pool**: write-back 策略, 将闲置 prefix 写入 CPU DRAM; KDA state 与 MLA KV cache 同步生命周期。
-- **Auto-throttling Scheduler**: 根据 runtime 信号动态控制并发, 平衡早期利用率和后期 KV cache 压力。
-- **AgentENV**: Firecracker microVM 沙箱。增量 checkpoint (133ms) / resume (49ms)。Pause/Resume/Fork/Snapshot 四个高级原语。训练期间共创建 51M+ 沙箱。
+#### 1. 四层结构
 
-### 推理与在线服务
+| 层次 | 核心问题 | 代表系统 |
+|---|---|---|
+| **5.1 算子与并行层** | KDA 的递归状态如何适配 GPU 与跨卡并行？ | `FlashKDA`、`KCP` |
+| **5.2 训练系统层** | 3T MoE、多模态和超大激活如何训练？ | `MoonEP`、Unified Activation Manager |
+| **5.3 RL 环境层** | 长轨迹、KV Cache 和沙箱如何持续运行？ | External KV Cache Pool、`AgentENV` |
+| **5.4 服务调度层** | 混合 Cache、长短请求和故障如何处理？ | Prefix Cache、Affinity Scheduling、Admission Control |
 
-- **KDA-Aware Prefix Cache**: 统一 KDA state 和 MLA KV cache 的 paged pool 管理。前缀哈希在 512-token hash block 粒度 (而非物理 block 6144 tokens), 显著提升命中率。
-- **高性能 Kernel**: KDA decoding 缓存投影输入而非 state, 支持 MTP 回滚。Block AttnRes 与 TP 融合。
-- **Cache-Aware Affinity Scheduling**: 通过 consistent hashing 维护 cache locality, 双集群容错。
-- **Budget-Based Admission Control**: 为不同请求类型分配独立资源预算。
+它们不是并列的项目，而是递进关系：
+
+```text
+架构定义计算模式
+    ↓
+Kernel 适配单卡执行
+    ↓
+Parallelism 适配多卡执行
+    ↓
+Memory System 管理状态和显存
+    ↓
+Scheduler 管理动态负载
+    ↓
+Serving System 管理用户级 SLO
+```
+
+### §5.1 KDA 系统协同设计：把固定状态优势兑现为实际吞吐
+
+KDA 用固定大小的 recurrent state 替代随序列增长的 KV Cache：
+
+$$
+S_t=M_tS_{t-1}+\beta_t k_tv_t^\top
+$$
+
+它换来了更低的长上下文状态成本，但也引入了新的系统问题：
+
+```text
+得到：固定大小 state，适合长上下文
+失去：token 之间完全独立的并行性
+```
+
+所以 KDA 的核心 Infra 问题不是传统 Attention 的二次复杂度，而是：
+
+> **状态 $S_t$ 依赖 $S_{t-1}$，GPU 不喜欢这种串行递推。**
+
+#### 5.1.1 `FlashKDA`：隐藏 chunk 之间的递归传播
+
+KDA 的 chunkwise 执行具有两种不同性质：
+
+```text
+chunk 内部：token-parallel，可并行
+chunk 之间：state propagation，存在串行依赖
+```
+
+朴素执行会变成：
+
+```text
+计算 Chunk 1
+等待 state
+计算 Chunk 2
+等待 state
+计算 Chunk 3
+```
+
+`FlashKDA` 用 CUTLASS 实现专用 kernel，将：
+
+- chunk 内 token-parallel 计算；
+- head-parallel 的 recurrent state propagation；
+
+进行重叠：
+
+```text
+Chunk 1 的 state 传播
+        与
+Chunk 2 的 chunk 内计算
+        重叠
+```
+
+因此 `FlashKDA` 的本质不是简单地“把 KDA 写成更快的 CUDA kernel”，而是：
+
+> **把 KDA 的串行依赖隐藏在可并行工作下面。**
+
+它同时服务 training 与 inference prefill。
+
+#### 5.1.2 `KCP`：把 KDA 的递归跨卡并行化
+
+超长序列需要 Context Parallelism。对于 vanilla linear attention，可以将各 rank 从 $S=0$ 开始计算的局部 state 做前缀累加；但 KDA 不行，因为它的更新包含 token-dependent matrix：
+
+$$
+S_t=M_tS_{t-1}+\beta_t k_tv_t^\top
+$$
+
+后续 segment 的结果不仅取决于自身 token，还取决于前一 segment 传入的 state，简单相加无法恢复真实状态。
+
+`KCP` 为每个 rank 计算两个局部量：
+
+1. **累计转移矩阵**
+
+$$
+M_{T\leftarrow1}
+$$
+
+表示该 segment 对输入 state 的变换；
+
+2. **从零状态生成的局部 state**
+
+$$
+\tilde{S}_T
+$$
+
+表示输入 state 为零时，该 segment 自身产生的状态。
+
+整个 segment 的输出可写为：
+
+$$
+S_{\mathrm{out}}
+=
+\tilde{S}_T+M_{T\leftarrow1}S_{\mathrm{in}}
+$$
+
+于是 KCP 的执行流程变成：
+
+```text
+各 rank 本地计算 M 和 S~
+        ↓
+交换固定大小的状态片段
+        ↓
+通过 prefix scan 恢复各 rank 的入站 state
+        ↓
+完成全局递归
+```
+
+关键收益是通信规模：
+
+```text
+Softmax Attention：
+需要交换随序列长度增长的 KV blocks
+
+KDA + KCP：
+交换固定大小的 recurrent state 片段
+```
+
+所以 KCP 把 KDA 的架构优势转化成了跨设备优势：
+
+> **KDA 的 state 不随 token 数增长，KCP 的同步载荷也不随序列长度增长。**
+
+需要避免的误读是：KDA 并非天然容易并行；它只是把逐 token 历史压缩成固定 state，`KCP` 才是将该 state 组织成跨卡并行算法的关键。
+
+#### 5.1.3 KDA Decode：为 speculative decoding 设计可重放状态
+
+KDA decoding 会原地更新 state。MTP/speculative decoding 如果先生成多个 draft token，验证时只接受其中一部分，state 可能已经推进到被拒绝的 token，不能直接回滚。
+
+朴素方案是为每个 draft position 保存完整 state，但这会造成巨大的 state traffic。K3 改为：
+
+```text
+缓存 projected inputs
+        ↓
+在 on-chip 重新执行 KDA recurrence
+        ↓
+只写回 verified tokens 与 bonus token 的 state
+```
+
+这是典型的：
+
+```text
+少存储 ↔ 多重算
+```
+
+### §5.2 3T 预训练基础设施：围绕三个瓶颈逐个击破
+
+K3 的 2.8T 级原生多模态 MoE 预训练，核心瓶颈不是一个，而是三个：
+
+```text
+问题一：MoE token routing 不均衡
+问题二：激活、梯度和优化器状态放不下
+问题三：视觉编码器的动态计算拖慢 pipeline
+```
+
+因此 §5.2 的结构与问题一一对应：
+
+| 训练瓶颈 | 系统方案 |
+|---|---|
+| EP 负载不均衡 | `MoonEP` |
+| 显存不足 | Unified Activation Manager、FP8、Recomputation、Offload、P2P Muon |
+| ViT 进入关键路径 | Dynamic CP、Pipeline Bubble Hiding |
+
+#### 5.2.1 `MoonEP`：把动态稀疏规整成固定硬件负载
+
+K3 使用大量 routed experts。MoE 的问题不是稀疏本身，而是 routing 造成：
+
+- 不同 EP rank 收到的 token 数不同；
+- 不同 expert 的 GEMM shape 动态变化；
+- buffer 容易碎片化；
+- Host 需要逐层同步实际 shape；
+- 整个 step 被最慢 rank 决定。
+
+目标是让每个 rank 接收固定数量的 token：
+
+$$
+S\times K
+$$
+
+其中 $S$ 是 sequence length，$K$ 是每个 token 选择的 expert 数。
+
+`MoonEP` 主要包含以下机制：
+
+- **动态冗余 expert：** 根据当前 micro-batch 的 router 输出，在线规划并预取冗余 expert，使各 rank 的 token 负载达到完美平衡。它不是强行改变模型路由，而是让硬件临时适配当前路由。
+- **有界冗余保证可行：** 报告证明每个 rank 至多需要 $E/R$ 个冗余 expert，即可保证存在可行的平衡方案；相比预设 token cap 的方案，训练不会因为当前 routing 无法满足 cap 而中断。
+- **Zero-copy communication：** 规划 kernel 预先计算 token 目的位置，使 token 直接进入 expert-grouped buffer，减少中间拷贝；在完美平衡条件下，通信 buffer 可以保持为固定的 $S\times K$ 规模。
+- **Sync-free static shapes：** 每个 rank 的总 token 数固定后，计算 shape 静态可知，消除逐层 Host 同步和一部分 kernel-launch 开销。
+- **Expert-GEMM workload-aware scheduling：** 跨 rank 平衡不代表 rank 内各 expert 平衡，因此还需根据当前 token distribution 调整 GEMM 调度参数，并将 shared expert GEMM 放到独立 stream，与其他计算重叠。
+
+核心结论：
+
+> **MoE 的系统难点是动态、不规则和不均衡；MoonEP 的任务是把动态稀疏重新规整成硬件喜欢的固定形状。**
+
+#### 5.2.2 Memory-Efficient Training：把显存管理抽象成可组合的存储策略
+
+3T 模型的显存不只包含参数，还包括：
+
+```text
+Parameters
+Gradients
+Optimizer states
+Activations
+Temporary communication buffers
+```
+
+K3 设计了统一的 Activation Manager，让每个需要在 backward 使用的 tensor 都可以选择可插拔存储后端：
+
+```text
+Activation Storage Policy
+├── 保存
+├── Recomputation
+├── Quantization
+├── GPU Offload
+├── Remote Offload
+└── 组合使用
+```
+
+在 K3 中，常见组合包括：
+
+- 大部分 activation 使用 block-wise FP8 quantization；
+- 与 offload/remote-offload 组合；
+- element-wise operator 使用 recomputation；
+- activation 在 layer 粒度预取，并与计算重叠；
+- GPU 内存统一由主计算 stream 的 memory pool 管理，降低多 stream 碎片。
+
+这部分的核心不是“用了 FP8”，而是：
+
+> **显存管理从模型代码中解耦出来，变成可以按 tensor 组合的存储系统。**
+
+此外还有几项针对性优化：
+
+- **Memory-efficient MoE backward：** 通过数学变换消除 backward 对 forward output 的依赖；group GEMM 前向只保存 dispatch 输入，反向时重算 dispatch，以计算换存储。
+- **Memory-efficient AttnRes：** Block representation 在边界层生成并被后续层共享；AttnRes 计算包在 checkpointing 中；pipeline 通信只增量传输新 block。
+- **跨 PP rank 的 activation balancing：** interleaved 1F1B 中各 PP rank 的 resident activation 不均衡，K3 通过 Mooncake Transfer Engine 将 activation remote offload 到其他 PP rank 的内存，降低局部 OOM 风险。
+- **Pipeline ZeRO-2 gradient sharding and offloading：** gradient 在 DP rank 间切分，并将分片放入 CPU memory；GPU 只保留必要的 double grad buffer。
+- **P2P-based Muon orthogonalization：** ZeRO 将参数切片，但 Muon 的 Newton–Schulz 需要完整矩阵。朴素 all-gather 会带来大内存和通信开销；K3 只通过 P2P 拉取当前所需 shard，并按 model chunk 将通信与计算流水化。
+
+#### 5.2.3 Multimodal Encoder Optimization：不要让 ViT 成为流水线短板
+
+大图和长视频会让视觉 encoder 的计算时间高度不均匀：
+
+```text
+文本计算已经完成
+        ↓
+等待某个大图 / 长视频 ViT
+        ↓
+整个 pipeline 被拖慢
+```
+
+K3 采用两类优化：
+
+- **Dynamic CP：** 将大图沿 patch 维度切分到多个设备，在 CP rank 间 gather KV；再将一个 CP group 划分为多个 sub-CP groups，把多个大视觉样本分布到不同子组，降低跨设备负载不均衡。
+- **Encoder computation in PP bubbles：** 将 ViT forward/backward 拆开：一部分提前同步执行，其余安排进 pipeline bubble，让视觉计算被文本计算覆盖。
+
+这里的关键不是让 ViT 单独更快，而是：
+
+> **减少一个模块耗时不等于减少端到端 step 耗时；如果模块可以被隐藏在已有 pipeline bubble 中，系统就可以在不显著增加总时延的情况下完成视觉计算。**
+
+### §5.3 1M Agentic RL：从 tensor 管理转向状态机管理
+
+§5.3 是 K3 Infra 与传统分布式训练最不同的部分。它处理的不只是 tensor，还包括：
+
+```text
+模型推理
++ 长轨迹状态
++ KV Cache
++ 训练迭代
++ 外部环境
++ 沙箱生命周期
+```
+
+因此本节分成两条线：
+
+```text
+5.3.1 管理模型侧的长上下文状态
+5.3.2 管理环境侧的 sandbox 状态
+```
+
+#### 5.3.1 Long-context RL：Partial Rollout 逼出可恢复系统
+
+百万 token 轨迹不可能要求所有样本在同一轮内完成，因此采用 `Partial Rollout`：
+
+```text
+第 i 轮：
+轨迹 A、B 完成
+轨迹 C、D 未完成
+
+先使用 A、B 更新策略
+暂停 C、D
+
+第 i+1 轮：
+恢复 C、D
+继续 rollout
+```
+
+这要求同时保存两类状态：
+
+```text
+模型侧：未完成轨迹的 KV Cache / KDA state
+环境侧：未完成轨迹的 sandbox 世界状态
+```
+
+因此 Partial Rollout 不是单独的 RL 算法，而是一个端到端恢复协议：
+
+```text
+轨迹暂停
+→ KV Cache 持久化
+→ sandbox checkpoint
+→ 下一轮恢复
+→ 继续 rollout
+```
+
+**External KV Cache Pool。** K3 使用 write-back 设计：
+
+```text
+活跃 decode：
+KV Cache 保留在 GPU
+
+变成 idle 的 prefix：
+从 GPU 写回 CPU DRAM
+
+下一次复用：
+预取回 GPU
+```
+
+只有被驱逐的 prefix 才写回 CPU，避免 GPU 与 CPU 始终保持两份活跃副本。由于 KDA 和 MLA 共同构成一个 prefix，KDA recurrent state 必须与 MLA KV blocks 一起 offload、一起 prefetch、一起恢复。
+
+**Rollout auto-throttling scheduler。** 轨迹长度会随 rollout 进展而增加，固定并发数不是好方案：
+
+- 按最终长度设定并发：前期过于保守；
+- 按早期长度设定并发：后期 KV Cache 压力过大。
+
+K3 根据 active request count、queued request count、KV Cache utilization 等运行时信号动态调节并发：
+
+```text
+早期：提高并发，填满硬件
+后期：降低并发，避免 KV Cache eviction / preemption
+```
+
+这揭示了 Agentic RL 与普通 batch inference 的差异：
+
+> **Agent rollout 的资源成本会随轨迹演化，不是静态的。**
+
+**Gradient-buffer reuse。** MOPD 或 RL loss 计算需要 reference model 做 forward-only 计算，但 reference model 权重太大，不能长期驻留 GPU。K3 将 reference weights 保存在 CPU，需要时流式写入 policy model 的 FP32 gradient buffer，并利用双 buffer 做当前 chunk 计算与下一 chunk 预取。
+
+#### 5.3.2 `AgentENV`：管理 Agent 所处的世界状态
+
+普通 container 不足以承载高探索性的 Agent，因为 Agent 可能：
+
+- 执行任意 shell 命令；
+- 修改系统文件；
+- 运行容器；
+- 启动虚拟机；
+- 触发 kernel panic、死锁或 reward hacking。
+
+因此 K3 采用基于 Firecracker 的 microVM sandbox，在隔离性和环境真实性之间取得平衡：
+
+| 方案 | 隔离性 | 环境真实性 | 启动成本 |
+|---|---:|---:|---:|
+| 普通进程 | 低 | 高 | 低 |
+| Container | 中 | 中 | 低 |
+| microVM | 高 | 高 | 中高 |
+
+`AgentENV` 的四个核心原语与训练需求一一对应：
+
+| 原语 | 训练需求 | 作用 |
+|---|---|---|
+| `Pause` | 等待模型生成或工具返回 | 释放 CPU / memory |
+| `Resume` | 下一轮继续未完成轨迹 | 从精确断点恢复 |
+| `Fork` | 无副作用地进行 reward judging | 从同一状态复制分支 |
+| `Snapshot` | 长任务容错与回滚 | 定期保存增量检查点 |
+
+底层使用增量 checkpoint/resume，只保存自上次检查点后被修改的 memory pages；报告给出的 checkpoint latency 最低约 133 ms，resume latency 最低约 49 ms。大规模启动方面，AgentENV 使用 OverlayBD、定制 `ublk` driver、存储层共享与 P2P transport，配合 copy-on-write memory 和 page-cache 优化，支持高密度沙箱运行。报告披露训练和评估期间共创建了 51,219,741 个 sandboxes，涉及 1,505,678 个 images。
+
+`AgentENV` 与 Partial Rollout 的关系是：
+
+```text
+Partial Rollout：
+暂停策略轨迹
+
+AgentENV：
+暂停环境状态
+
+External KV Pool：
+暂停模型上下文状态
+```
+
+三者共同构成可执行的长程 Agent RL。
+
+### §5.4 Inference and Online Serving：从单请求效率走向系统可预测性
+
+在线服务阶段面对的是训练端的同一组问题，但约束更严格：
+
+```text
+混合 KDA / MLA cache
++ 新架构 kernel
++ 稀疏专家
++ 1M context
++ 请求成本跨度约三个数量级
++ 多租户 SLO
+```
+
+因此 §5.4 分成三层：
+
+```text
+单请求内部：KDA-aware Prefix Cache
+单设备内部：高性能 Kernel
+集群层面：Cache-aware Scheduling + Admission Control
+```
+
+#### 5.4.1 KDA-aware Prefix Cache：两类状态必须联合恢复
+
+K3 的 hybrid attention 同时维护：
+
+| 类型 | 存储形态 | 增长方式 |
+|---|---|---|
+| KDA state | 每个请求一份 recurrent state | 固定大小 |
+| Gated MLA KV | 每个 token 的 KV block | 随序列增长 |
+
+一个 prefix 只有在两者都被恢复时才真正可复用：
+
+```text
+MLA prefix 命中
+但 KDA state 缺失
+→ 仍不能直接继续
+```
+
+K3 将 KDA states 和 MLA KV blocks 放入统一 paged pool，共享 allocation、reference counting、eviction 和 transfer 逻辑。
+
+**存储粒度与索引粒度解耦。** 如果 6144 tokens 的 physical block 必须作为完整单位参与 prefix matching，短请求或部分命中几乎无法复用。K3 采用：
+
+```text
+physical allocation block：粗粒度，例如 6144 tokens
+prefix hash block：细粒度，例如 512 tokens
+```
+
+KDA checkpoints 只在 hash boundary 持久化。于是可以在一个物理 block 内部命中，例如：
+
+```text
+物理 block：6144 tokens
+命中边界：2560 tokens
+```
+
+恢复流程是：
+
+```text
+恢复 2560 token 位置的 KDA checkpoint
+复用 MLA 前 2560 token 的 KV
+从 token 2560 继续 prefill
+```
+
+这是一个通用系统原则：
+
+> **物理存储粒度服务于分配效率，逻辑索引粒度服务于复用效率，两者不应被强行绑定。**
+
+#### 5.4.2 High-performance Kernels：针对不同模块的真实瓶颈优化
+
+- **KDA decoding：** 不保存每个 draft position 的完整 recurrent state，而是缓存 projected inputs，在 fused kernel 中重放 short convolution、input normalization、gating、KDA recurrence 和 output normalization。
+- **Block AttnRes：** prefill 阶段使用 sequence parallelism，让 block representation 在一个 rank 上物化，避免每个 TP rank 重复保存；decode 阶段将 inter-block kernel 放到 side stream，与主计算重叠，并把 intra-block merge、partial-sum update 和 RMSNorm 融合到前置 TP all-reduce。
+- **Stable LatentMoE：** latent down-projection 与 router 融合；latent weight 跨 rank shard，并将 output all-gather 融入 GEMM epilogue；小 batch routed expert decode 使用 token-centric 的 WarpDecode 风格 kernel，以适配 memory-bound weight streaming。
+
+#### 5.4.3 Fleet-level Scheduling：长请求不能拖死短请求
+
+生产流量同时包含小于 2K tokens 的短请求和接近 1M tokens 的超长请求，按平均请求做 capacity planning、queueing 或 rate limit 会失效。
+
+**Cache-aware affinity scheduling。** 1M context 下，一个 coding request 可能有 400K prefix、只新增 4K tokens。cache hit 与 miss 的成本差异极大，因此请求应路由到持有其 prefix cache 的 cluster。
+
+但 session 绑定 cluster 会放大故障影响。K3 使用 consistent hashing 为每个 session 分配：
+
+```text
+Primary cluster：常态服务并持有 cache
+Secondary cluster：故障接管，但需要重新 prefill
+```
+
+这样常态保留 cache locality，单 cluster 故障时 re-prefill 工作又能分散到多个 cluster。
+
+**Budget-based admission control。** 长请求突发可能占满计算资源，使短请求 TTFT 全面恶化。K3 不按请求数做粗粒度限流，而是给不同 request class 分配独立 resource budget：
+
+```text
+长上下文请求只能消耗自己的预算
+不能污染短请求的系统级 SLO
+```
+
+### §5.5 把 §5 压缩成五个系统问题
+
+阅读 §5 时，项目名不是重点，真正需要追踪的是以下五个问题：
+
+| 系统问题 | K3 对应机制 | 核心判断 |
+|---|---|---|
+| 计算能否并行？ | `FlashKDA`、`KCP`、Dynamic CP、Pipeline Bubble Hiding | 把串行部分隐藏、分解或放进已有空隙 |
+| 每张卡负载是否均衡？ | `MoonEP`、Workload-aware GEMM、Sub-CP、Activation Balancing | 分布式速度由最慢设备决定，尾部负载比平均负载重要 |
+| 状态应该放在哪里？ | Activation Manager、FP8、Recompute、Offload、External KV Pool | 根据活跃度、恢复成本和带宽选择存储层级 |
+| 状态能否暂停、恢复、复制？ | Partial Rollout、AgentENV、Checkpoint、Projection Replay | 长程 Agent 系统的基本抽象是可持久化状态机 |
+| 动态流量下是否可预测？ | Auto-throttling、Affinity、Admission Control | 生产系统不只追求峰值吞吐，更要控制 SLO 尾部风险 |
+
+### §5.6 第 4 部分与第 5 部分的关系
+
+第 4 部分定义 workload，第 5 部分承载 workload：
+
+| 第 4 部分提出的需求 | 第 5 部分提供的 Infra |
+|---|---|
+| 1M 长轨迹 | External KV Cache Pool |
+| Partial Rollout | AgentENV Resume + KV state persistence |
+| 多步工具调用 | Auto-throttling Scheduler |
+| Agent 环境探索 | microVM Sandbox |
+| 多模型 MOPD | Gradient-buffer Reuse |
+| KDA 长上下文 | FlashKDA + KCP |
+| 3T MoE 训练 | MoonEP + Memory-efficient Training |
+| 部署成本约束 | Prefix Cache + Scheduling + Admission Control |
+
+因此：
+
+```text
+第4部分：定义模型要学什么、如何获得 reward
+第5部分：提供让这些训练过程可执行、可恢复、可扩展的系统
+```
+
+第 4、5 部分不是两个独立章节，而是：
+
+> **第 4 部分定义 workload，第 5 部分优化 workload 的执行成本。**
+
+### §5.7 三个最重要的判断
+
+#### 判断一：K3 Infra 不是训练完成后的“优化层”
+
+错误理解是：
+
+```text
+先设计架构
+→ 训练模型
+→ 最后用 Infra 优化速度
+```
+
+K3 更接近：
+
+```text
+架构、训练范式、Infra 同时设计
+```
+
+例如：
+
+- KDA 的固定 state 影响 `KCP`；
+- 896 experts 逼出 `MoonEP`；
+- Partial Rollout 逼出 checkpoint/resume；
+- KDA + MLA 逼出联合 prefix cache；
+- AttnRes 的 block 化降低通信和存储成本。
+
+#### 判断二：K3 反复把不规则性转换成规则性
+
+```text
+递归 state
+→ chunkwise / prefix scan
+
+动态 expert routing
+→ 固定 token shape
+
+动态 activation
+→ tensor-level storage policy
+
+超长 trajectory
+→ 可暂停、可恢复状态
+
+混合 cache
+→ 统一 paged pool
+
+长短请求混部
+→ 分级 resource budget
+```
+
+所以 §5 的底层主题是：
+
+> **把模型天然的不规则性转换成硬件和集群能够处理的规则化工作负载。**
+
+#### 判断三：瓶颈从 FLOPs 扩展到状态管理
+
+传统 LLM Infra 更常问：
+
+```text
+矩阵乘法够不够快？
+```
+
+K3 §5 更常问：
+
+```text
+状态在哪里？
+什么时候搬？
+能不能复用？
+能否恢复？
+谁在等待？
+如何避免一个长任务拖死其他任务？
+```
+
+这正是从传统 LLM 训练 Infra 走向 Agent Infra 的分水岭。
+
+### §5.8 学习方法
+
+不建议只按项目名背诵。每读一个机制，都用下面的模板记录：
+
+```text
+架构 / workload 特征：
+它带来了什么系统瓶颈：
+为什么普通方案解决不了：
+K3 的核心机制：
+节省的是计算、显存、通信、延迟还是尾部风险：
+它与前后章节如何连接：
+```
+
+推荐阅读顺序：
+
+```text
+1. §5 总述：建立四层地图
+2. §5.1：理解 KDA 为什么需要系统协同
+3. §5.2.1：用 MoonEP 理解 MoE 的负载均衡
+4. §5.2.2：理解超大模型的显存管理
+5. §5.3：重点理解 Partial Rollout ↔ KV Cache ↔ AgentENV
+6. §5.4.1：理解训练期 cache 与服务期 cache 的统一问题
+7. §5.4.3：理解集群级 SLO 和资源隔离
+```
+
+### §5.9 最短记忆版
+
+> **K3 Infra 的任务，是把固定状态、稀疏路由、超大模型、百万 token 轨迹和混合在线流量，重新组织成 GPU、网络、存储和调度系统能够稳定执行的规则化工作负载。**
 
 ---
 
 ## 实验结果
 
-### 主要 Benchmark 定位
+### §6 评估部分的逻辑线：从“模型有多强”到“模型是否值得部署”
+
+第 6 部分不是简单展示 benchmark 分数，而是在回答五个递进问题：
+
+```text
+模型覆盖了哪些能力？
+        ↓
+这些能力如何被公平、可复现地比较？
+        ↓
+模型在真实工作流、长程 Agent 和高风险场景中是否可靠？
+        ↓
+外部独立评估是否支持内部结论？
+        ↓
+达到这些能力需要多少推理成本？
+```
+
+所以 §6 的真正主题是：
+
+> **建立一个从能力覆盖、实验可比性、内部故障诊断、安全边界、外部校验到经济可用性的完整证据链。**
+
+### 6.0 先区分三类“评估”
+
+阅读本节时，不要把所有分数看成同一种东西。K3 实际上同时做三类评估：
+
+| 类型 | 主要问题 | 典型指标 |
+|---|---|---|
+| **能力评估** | 模型能不能完成任务？ | accuracy、pass rate、F1、Elo |
+| **行为与边界评估** | 模型如何完成任务，哪里会失败，风险边界在哪？ | tool-use quality、效率、纪律、漏洞发现/利用、轨迹 failure modes |
+| **经济评估** | 达到这个能力需要多少资源？ | score vs. cost per task |
+
+三者不能互相替代：
+
+```text
+高分 ≠ 行为可靠
+行为可靠 ≠ 安全
+安全能力 ≠ 低成本
+```
+
+### 6.1 第一层：公开主评估，建立能力地图与横向排名
+
+#### 6.1.1 先按能力轴拆解，而不是给出单一总分
+
+K3 用四个能力轴组织公开 benchmark：
+
+```text
+Reasoning & Knowledge
+Coding
+Agentic
+Vision
+```
+
+这四个轴对应 K3 的产品和技术目标：
+
+| 能力轴 | 主要测量对象 | 代表问题 |
+|---|---|---|
+| **Reasoning & Knowledge** | 知识、推理、研究级问题 | 模型能否解决高难度抽象问题？ |
+| **Coding** | 软件工程与长程代码执行 | 模型能否从理解需求走到可运行交付物？ |
+| **Agentic** | 搜索、工具调用、企业工作流、电脑操作 | 模型能否在环境中持续行动并完成目标？ |
+| **Vision** | 图像、视频、文档和视觉工具使用 | 模型能否把视觉输入接入推理和执行闭环？ |
+
+这一步的逻辑是：
+
+> **先定义能力空间，再在每个能力轴内部用多个 benchmark 采样，避免用一个总分掩盖能力结构。**
+
+#### 6.1.2 为什么每个能力轴需要多个 benchmark
+
+单个 benchmark 只能测量一个任务分布，不能代表完整能力。例如：
+
+- `GPQA Diamond` 反映研究生级推理，但不能代表研究级开放问题；
+- `ProgramBench` 反映代码能力，但不能替代长程软件工程；
+- `BrowseComp` 反映搜索型 Agent 能力，但不能代表电脑操作或企业协作；
+- `OmniDocBench` 反映文档视觉理解，但不能代表视频或视觉工具调用。
+
+因此公开评估采用的是：
+
+```text
+能力轴
+    ↓
+多个任务分布
+    ↓
+多个指标
+    ↓
+能力画像，而不是单一分数
+```
+
+#### 6.1.3 Baseline：把“强”转化为相对位置
+
+K3 将自己与：
+
+- Claude Fable 5；
+- GPT-5.6 Sol；
+- Claude Opus 4.8；
+- GPT-5.5；
+- GLM-5.2；
+
+进行比较。
+
+这一步不是为了证明“所有任务第一”，而是确定 K3 在不同能力轴上的相对位置：
+
+```text
+哪些维度接近最强闭源模型？
+哪些维度领先同档模型？
+哪些维度仍存在明显差距？
+```
+
+报告的总体结论是：K3 接近最强 proprietary models，同时整体领先 Claude Opus 4.8、GPT-5.5 和 GLM-5.2，但并非全面第一。
+
+#### 6.1.4 Evaluation Configuration：先保证比较有效，再看分数
+
+K3 专门列出 evaluation configuration，说明 benchmark 分数不是脱离实验协议的事实。
+
+需要控制的变量包括：
+
+```text
+reasoning effort
+temperature
+top-p
+harness
+tool augmentation
+任务版本
+GPU / 硬件环境
+运行次数
+评判器与 leaderboard 版本
+```
+
+具体例子：
+
+- 单步 reasoning / knowledge 任务使用 `top-p = 0.95`；
+- coding 和 agentic 场景使用 `top-p = 1.0`；
+- coding 模型可能运行在 `Kimi Code`、`Claude Code` 或 `Codex` harness 下；
+- 视觉 benchmark 区分是否使用 Python tool；
+- vision 分数通常多次运行取平均；
+- 某些 benchmark 明确固定任务版本、GPU 校准分支和官方 evaluation script。
+
+这一层的关键判断：
+
+> **Benchmark 分数只有在任务、harness、采样策略、工具、版本和统计方式透明时，才具有横向比较意义。**
+
+也要警惕比较中的不对称：
+
+- 不同模型可能使用不同 harness；
+- 某些模型包含 fallback；
+- 某些模型可能拒答或触发 cyberguard；
+- 第三方 leaderboard 可能使用各自的配置；
+- Elo 会随新增比赛动态漂移。
+
+因此，§6.1 不只是“跑分”，还在做 evaluation protocol engineering。
+
+#### 6.1.5 Results：不报总平均，而是报告能力结构
+
+公开结果的阅读方式应是“看强弱分布”，不是只找最高分。
+
+**Reasoning & Knowledge。**
+
+- `GPQA Diamond` 达到 93.5%，说明研究生级知识推理接近 frontier；
+- `HLE-Full` 与 `CritPt` 仍落后，说明 research-level open-ended reasoning 是短板。
+
+**Coding。**
+
+- `ProgramBench` 77.8%，`SWE-Marathon` 42.0%，说明代码生成、GPU kernel 和长程工程执行是强项；
+- `DeepSWE`、`FrontierSWE` 并非全面第一，说明不同 software-engineering distribution 上仍有差异。
+
+**Agentic。**
+
+- `BrowseComp`、`DeepSearchQA`、`MCPMark-Verified`、`AutomationBench` 等表现强；
+- GDPval-AA v2、AA-Briefcase 等 Elo 型 knowledge-work suite 仍落后于 Claude Fable 5。
+
+**Vision。**
+
+- `OmniDocBench` 表现突出；
+- Python tool 能显著提升 `Math-Vision`、`ZeroBench-main` 等任务，说明模型能力和外部工具之间存在互补关系。
+
+公开评估最终要形成的是：
+
+```text
+不是“K3 排第几”
+而是“K3 在什么能力上强、在什么能力上弱、工具如何改变结果”
+```
+
+### 6.2 第二层：内部评估，把公开 benchmark 变成开发诊断系统
+
+公开 benchmark 适合对外比较，但不适合快速指导下一轮训练，因为它们：
+
+- 更新频率低；
+- 任务覆盖有限；
+- 往往不能反映真实产品流量；
+- 对失败轨迹和行为质量解释不足。
+
+因此 K3 维护一套频繁刷新、与真实使用场景接近的 internal evaluation suite。
+
+其作用不是再做一次排名，而是：
+
+```text
+发现 failure modes
+        ↓
+定位能力缺口
+        ↓
+修改数据、reward、harness 或训练策略
+        ↓
+重新评估
+```
+
+#### 6.2.1 内部评估的三类任务
+
+| 类别 | 主要测量内容 | 代表 benchmark |
+|---|---|---|
+| **Coding Capability & Experience** | 端到端软件工程、Web 开发、真实 coding workflow | Kimi Code Bench 2.0、Kimi Webdev Bench、Coding Experience |
+| **General Agent Experience** | 多日任务、多 Agent 协作、自治执行、视觉 Agent、研究和专业工作 | 24/7 ClawBench 2.0、MIRA、KAET、Swarm Bench、Deep Research Bench、Finance Bench、Agent Behavior Bench |
+| **Conversational Experience** | 事实性、幻觉、真实产品对话体验 | Faithfulness、Chat All-in-One Bench |
+
+它们测量的对象比公开 benchmark 更接近产品：
+
+```text
+公开 benchmark：模型是否做对一道题？
+内部 benchmark：模型能否在真实工作流中持续、合适、可靠地工作？
+```
+
+#### 6.2.2 从“结果正确”扩展到“过程质量”
+
+`Agent Behavior Bench` 是一个关键转折点。它不仅看任务是否完成，还评估：
+
+- tool-use behavior；
+- efficiency；
+- discipline；
+- 是否会陷入无效循环；
+- 是否以合适方式完成任务。
+
+这说明 Agent 的评价函数从：
+
+$$
+\text{Success}=\mathbf{1}[\text{最终结果正确}]
+$$
+
+扩展为：
+
+$$
+\text{Agent Quality}
+=
+\text{Outcome}
++\text{Process}
++\text{Efficiency}
++\text{Discipline}
+$$
+
+对真实产品来说，这比单纯 pass rate 更重要，因为一个偶尔成功但极度浪费 token、频繁调用错误工具、无法沟通进度的 Agent，产品价值并不高。
+
+#### 6.2.3 为什么内部评估是反馈回路
+
+报告明确强调：内部 benchmark 会持续刷新和扩展，以跟踪模型不断变化的 failure modes，并直接指导 data 与 training iterations。
+
+因此评估体系不是开发末端的验收，而是训练系统的一部分：
+
+```text
+训练
+  ↓
+内部评估
+  ↓
+failure mode analysis
+  ↓
+数据 / reward / harness / 算法调整
+  ↓
+下一轮训练
+```
+
+这是 §6 最重要的系统性含义。
+
+### 6.3 第三层：网络安全评估，测量能力边界与滥用风险
+
+网络安全评估不是普通 capability benchmark 的附属项，而是一个具有风险分层的独立评估轨道。
+
+K3 采用两级递进结构：
+
+```text
+Tier 1：漏洞发现 + PoC 复现
+        ↓
+Tier 2：端到端漏洞利用
+```
+
+#### Tier 1：偏防御性的漏洞发现
+
+任务要求模型在真实代码库中：
+
+- 发现 genuine bugs，而非只复现已知漏洞；
+- 编写 proof of concept；
+- 证明漏洞可以复现。
+
+覆盖 Linux kernel、数据库、AI service、web framework、blockchain、VPN 等真实软件。
+
+这里测量的是：
+
+```text
+代码理解
+漏洞定位
+实验设计
+可复现性验证
+```
+
+#### Tier 2：偏攻击性的 exploit development
+
+Tier 2 要求把漏洞转化为端到端 exploit，分成：
+
+- user-space exploitation：16 tasks；
+- Linux kernel exploitation：20 tasks。
+
+每个任务都有可复现环境，并由人类专家确认可解。于是未完成任务可以直接作为与人类能力差距的证据，而不是简单的“模型没答对”。
+
+#### 为什么要做风险分层
+
+安全能力不是一个标量：
+
+```text
+发现漏洞
+    < 构造 PoC
+    < 利用用户态漏洞
+    < 绕过缓解措施
+    < 完成内核级端到端利用
+```
+
+K3 在 Tier 1 和 user-space Tier 2 表现更强，但 hardened target 上的 exploit chain completion 仍是瓶颈。轨迹分析还揭示了具体失败模式：
+
+1. 已经取得 primitive，却无法完成 exploit chain 的最后阶段；
+2. 在 mitigation 存在时策略选择不佳；
+3. 陷入冗长、无效的 debugging loop；
+4. 提交前没有充分验证最终 deliverable。
+
+这比“Tier 2 得分 38.9%”更有价值，因为它告诉训练和系统下一步应该修什么。
+
+同时，报告把结果定义为当前模型和当前覆盖范围下的 **lower bound**，而不是能力上限。原因是：
+
+- 评估版本会变化；
+- 任务覆盖不可能穷尽；
+- 未完成任务可能受当前 harness 或工具限制；
+- 安全能力还会继续演进。
+
+### 6.4 第四层：第三方评估，降低自测偏差
+
+内部评估可能存在选择偏差、配置偏差和自我验证问题，因此 K3 引入独立第三方：
+
+| 第三方类型 | 评估方式 | 主要价值 |
+|---|---|---|
+| Artificial Analysis | 综合 Intelligence Index、行业 benchmark、成本数据 | 统一外部排名与成本视角 |
+| Vals AI | GDP-weighted industry benchmark | 衡量专业工作价值 |
+| Arena | 人类偏好、Elo | 观察真实用户主观偏好 |
+| UK AISI / NIST CAISI | 独立网络安全评估 | 校验高风险能力结论 |
+
+第三方评估不是为了替代内部 benchmark，而是承担不同职责：
+
+```text
+内部评估：高频、可诊断、服务训练迭代
+第三方评估：独立、可对照、降低自我报告偏差
+```
+
+需要注意第三方结果的边界：
+
+- 各家配置和 harness 可能不同；
+- leaderboard 的样本规模和排名会变化；
+- Elo 分数不是固定物理量，会随新增比赛漂移；
+- 不同机构的综合指数不可直接当作同一量纲。
+
+因此正确读法是看“多个独立来源是否共同支持大方向”，而不是机械比较所有数字。
+
+### 6.5 第五层：成本效率，把能力分数转成产品价值
+
+单看 benchmark score 隐含了一个错误假设：
+
+```text
+只要分数更高，模型就更好
+```
+
+真实部署还需要考虑每个任务的推理成本。于是 K3 对四个 coding / agentic suites 同时画：
+
+```text
+Score
+vs.
+Cost per task
+```
+
+这是从“能力排名”转向“能力—成本前沿”的关键一步。
+
+理想模型不是单纯 score 最高，而是位于 Pareto frontier：
+
+```text
+不存在另一个模型：
+分数更高且成本更低
+```
+
+K3 报告的核心成本结论包括：
+
+- 在 `Kimi Code Bench 2.0` 上，以约 38% 的 Claude Fable 5 成本取得仅低 4 分的成绩；
+- high effort 下，接近 Claude Opus 4.8 max effort 的成绩，成本约为其三分之一；
+- 在 `BrowseComp` 上达到 91.2%，每任务约 $2.03，成本低于 GPT-5.6 Sol 和 Claude 系列；
+- 在 `GDPval-AA v2` 与 `AA-Briefcase` 上，分数接近或位于前列，但成本显著更低。
+
+成本效率评估实际上把前面各章连接起来：
+
+```text
+架构：
+KDA、MoE、AttnRes 降低计算与状态成本
+
+训练：
+Deployment-aware post-training、QAT、EAGLE-3
+
+基础设施：
+Kernel、Prefix Cache、Scheduling、Admission Control
+
+最终：
+更低 cost per task
+```
+
+所以成本效率不是第 6 部分末尾附加的商业指标，而是前面所有技术选择的综合结果。
+
+### 6.6 §6 的完整证据链
+
+把整节串起来：
+
+```text
+1. 公开 benchmark
+   建立四大能力轴和跨模型相对位置
+        ↓
+2. 配置与协议透明
+   让比较具有可解释性
+        ↓
+3. 内部 benchmark
+   补齐公开任务未覆盖的真实工作流
+        ↓
+4. 轨迹与 failure mode 分析
+   从“多少分”推进到“为什么失败”
+        ↓
+5. 网络安全专项
+   测量高风险能力边界与滥用风险
+        ↓
+6. 第三方独立验证
+   降低内部自测偏差
+        ↓
+7. Score vs. Cost
+   判断能力是否具有产品和经济可行性
+```
+
+这条链条回答的不是一个问题，而是七个问题：
+
+| 问题 | §6 对应部分 |
+|---|---|
+| 模型覆盖哪些能力？ | Public Benchmarks |
+| 横向比较是否公平？ | Baselines + Evaluation Configurations |
+| 真实产品工作流表现如何？ | Internal Evaluation |
+| 模型具体会在哪里失败？ | Failure-mode / Trajectory Analysis |
+| 高风险能力边界在哪里？ | Cyber Security Evaluation |
+| 内部结论是否可信？ | Third-party Evaluation |
+| 能力是否值得部署？ | Cost Efficiency |
+
+### 6.7 第 6 部分和前面各部分的关系
+
+| 前面章节 | 评估如何承接 |
+|---|---|
+| **架构** | 评估 KDA 的长上下文、Stable LatentMoE 的代码/Agent 能力、MoonViT-V2 的视觉能力是否兑现 |
+| **预训练** | GPQA、HLE、视觉与长上下文任务检验预训练数据和架构是否形成基础能力 |
+| **Post-Training** | Coding、Agentic、工具增强和多推理 effort 评估 RL / MOPD 是否把能力写入模型 |
+| **Infra** | 长程 Agent、1M context、复杂 harness 和 cost-per-task 评估基础设施是否真正支撑能力 |
+| **部署** | Score vs. cost、TTFT 影响、工具和 cache 配置决定能力是否能以可接受成本交付 |
+| **安全** | Cyber Tier 1/2、Agent Behavior、reward hacking 相关评估界定发布边界 |
+
+因此第 6 部分不是全篇最后“报成绩”，而是前五部分的验证层：
+
+```text
+架构提出能力假设
+训练把能力写入模型
+Infra 让能力可以运行
+评估验证能力是否真实、可靠、可部署
+```
+
+### 6.8 三个最重要的判断
+
+#### 判断一：评估的核心不是排名，而是可解释的能力画像
+
+一个总榜排名无法告诉你：
+
+- 模型是否真的擅长长程 Agent；
+- 代码结果是否依赖特定 harness；
+- 视觉能力是否依赖 Python tool；
+- 为什么 research-level reasoning 仍然失败；
+- Agent 是结果不对，还是过程低效。
+
+K3 用四大能力轴、内部工作流、行为评分和安全专项，把“一个总分”拆成可行动的能力结构。
+
+#### 判断二：内部评估比公开榜单更接近训练方向盘
+
+公开 benchmark 的价值是对外可比；内部 benchmark 的价值是：
+
+```text
+高频刷新
+→ 跟踪 failure modes
+→ 直接改数据、reward、harness 和训练
+```
+
+所以评估体系是模型开发的反馈控制器，而不是最终验收表。
+
+#### 判断三：最终目标不是最高分，而是能力—成本—风险的可行解
+
+完整的产品目标更接近：
+
+$$
+\text{Utility}
+=
+f(\text{Capability},\text{Reliability},\text{Safety},\text{Cost})
+$$
+
+这四个维度中任何一个过低，模型都不一定可用：
+
+```text
+能力高但成本不可接受 → 无法大规模部署
+能力高但行为不稳定 → 用户体验差
+能力高但安全边界不清 → 发布风险高
+成本低但能力不足 → 没有产品价值
+```
+
+### 6.9 最短记忆版
+
+> **K3 §6 不是“跑了多少 benchmark”，而是用公开榜单建立能力地图，用内部评估定位 failure modes，用网络安全评估划定风险边界，用第三方评估降低自测偏差，最后用 score–cost frontier 判断这些能力是否值得部署。**
+
+#### 主要 Benchmark 定位
 
 - **推理与知识**: GPQA Diamond 93.5 (并列第一); **HLE-Full 和 CritPt 落后**, 是明确弱点
 - **Coding**: ProgramBench 第一 (77.8%); SWE-Marathon 第一 (42.0%, 领先 7 分); FrontierSWE 第二 (81.2%); DeepSWE 第三 (67.5%)
 - **Agentic**: BrowseComp 第一 (91.2%); AutomationBench 第一 (30.8%); GDPval-AA v2 Elo 第三 (1686)
 - **Vision**: OmniDocBench 第一 (91.1%); Math-Vision + Python 工具 97.8%
 
-### 成本效率
+#### 成本效率
 
 在 Kimi Code Bench 2.0 上: Kimi K3 以 Claude Fable 5 **38% 的成本**达到相差 4 分的成绩, high effort 已等效于 Claude Opus 4.8 max effort, 成本为其 1/3。
 
-### 网络安全评估
+#### 网络安全评估
 
 - Tier 1 (漏洞发现): 发现 16 个之前未知的漏洞, 包括 Linux 内核远程 DoS 和 Dirty-COW 级本地提权。
 - Tier 2 (漏洞利用): 解决 14/36 tasks (38.9%), 高于 GLM-5.2 的 22.2%。但仍存在明显的能力差距 -- 人类专家可解决全部 36 题。
